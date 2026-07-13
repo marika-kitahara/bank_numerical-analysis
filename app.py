@@ -1,4 +1,3 @@
-
 import streamlit as st
 import pandas as pd
 import plotly.graph_objects as go
@@ -22,73 +21,116 @@ category_orders = {
 
 # サイドバー：ファイルアップロード
 st.sidebar.header("ファイルアップロード")
-uploaded_data = st.sidebar.file_uploader("後方数値データをアップロード", type=["xlsx"])
+
+uploaded_data = st.sidebar.file_uploader(
+    "後方数値データをアップロード",
+    type=["xlsx"],
+    key="uploaded_data",
+)
 
 uploaded_master = st.sidebar.file_uploader(
     "媒体コードマスタをアップロード",
     type=["xlsx"],
-    help="BOXから最新版をダウンロードしてアップロードしてください"
+    key="uploaded_master",
+    help="BOXから最新版をダウンロードしてアップロードしてください",
 )
+
 st.sidebar.markdown(
-    "[📂 媒体コードマスタはこちら](https://rak.box.com/s/ocqdd7wgeoqnymhe7lkifycmnckpyncr)"
+    "[📂 媒体コードマスタはこちら]"
+    "(https://rak.box.com/s/ocqdd7wgeoqnymhe7lkifycmnckpyncr)"
 )
-# マスタファイル読み込み（GitHub固定）
-if uploaded_master is not None:
+
+
+def normalize_column_name(value):
+    """Excel列名の前後空白・全角空白・NBSPを除去する。"""
+    return str(value).strip().replace("\u3000", "").replace("\xa0", "")
+
+
+def normalize_code(value):
+    """媒体コードを突合しやすい文字列へ統一する。"""
+    if pd.isna(value):
+        return pd.NA
+
+    if isinstance(value, float) and value.is_integer():
+        return str(int(value))
+
+    text_value = str(value).strip()
+
+    if text_value.endswith(".0"):
+        text_value = text_value[:-2]
+
+    return text_value
+
+
+# ----------------------------------------------------
+# 媒体コードマスタ読み込み
+# ----------------------------------------------------
+if uploaded_master is None:
+    st.info("媒体コードマスタをアップロードしてください。")
+    st.stop()
+
+try:
     master = pd.read_excel(uploaded_master)
+except Exception as exc:
+    st.error(f"媒体コードマスタの読み込みに失敗しました：{exc}")
+    st.stop()
 
-    master.columns = [
-        str(c).strip().replace("\u3000", "").replace("\xa0", "")
-        for c in master.columns
-    ]
+master.columns = [normalize_column_name(col) for col in master.columns]
 
-    master.rename(
-        columns={
-            "会社名": "媒体名",
-            "メニューコード": "カテゴリ",
-        },
-        inplace=True,
+# 実ファイルの列名を、アプリ内で使う共通名へ変換
+master.rename(
+    columns={
+        "会社名": "媒体名",
+        "メニューコード": "カテゴリ",
+    },
+    inplace=True,
+)
+
+required_master_columns = ["媒体名", "カテゴリ"]
+missing_master_columns = [
+    col for col in required_master_columns if col not in master.columns
+]
+
+if missing_master_columns:
+    st.error(
+        "媒体コードマスタに必要な列がありません："
+        + "、".join(missing_master_columns)
+    )
+    st.write("読み込んだ列名：", master.columns.tolist())
+    st.stop()
+
+# すでに「媒体コード」列がある縦持ち形式と、
+# 複数のコード列を持つ横持ち形式の両方に対応
+if "媒体コード" in master.columns:
+    master_long = master[
+        ["媒体名", "カテゴリ", "媒体コード"]
+    ].copy()
+else:
+    id_vars = ["媒体名", "カテゴリ"]
+    code_cols = [col for col in master.columns if col not in id_vars]
+
+    if not code_cols:
+        st.error("媒体コードとして使用できる列が見つかりませんでした。")
+        st.stop()
+
+    master_long = master.melt(
+        id_vars=id_vars,
+        value_vars=code_cols,
+        var_name="コード列",
+        value_name="媒体コード",
     )
 
-    id_vars = [
-        col for col in ["媒体名", "カテゴリ"]
-        if col in master.columns
-    ]
+master_long["媒体コード"] = master_long["媒体コード"].map(normalize_code)
+master_long["媒体名"] = master_long["媒体名"].astype("string").str.strip()
+master_long["カテゴリ"] = master_long["カテゴリ"].astype("string").str.strip()
 
-    if "媒体コード" in master.columns:
-        master_long = master[
-            [col for col in ["媒体名", "カテゴリ", "媒体コード"]
-             if col in master.columns]
-        ].copy()
-
-        master_long = master_long.dropna(subset=["媒体コード"])
-
-    else:
-        code_cols = [
-            col for col in master.columns
-            if col not in id_vars
-        ]
-
-        master_long = master.melt(
-            id_vars=id_vars,
-            value_vars=code_cols,
-            var_name="コード列",
-            value_name="媒体コード",
-        ).dropna(subset=["媒体コード"])
-    
-    # 横持ち形式ならmeltする
-    else:
-        code_cols = [col for col in master.columns if col not in id_vars]
-
-        master_long = master.melt(
-            id_vars=id_vars,
-            value_vars=code_cols,
-            var_name="コード列",
-            value_name="媒体コード"
-        ).dropna(subset=["媒体コード"])
-
-else:
-    st.warning("媒体コードマスタをアップロードしてください。")
-    st.stop()
+master_long = (
+    master_long
+    .dropna(subset=["媒体コード"])
+    .loc[lambda df_: df_["媒体コード"].astype(str).str.strip() != ""]
+    .drop_duplicates(subset=["媒体コード", "媒体名", "カテゴリ"])
+    .reset_index(drop=True)
+)
 
 # 後方数値データ読み込み
 if uploaded_data is not None:
@@ -126,15 +168,18 @@ if uploaded_data is not None:
     else:
         df['承認区分'] = 'NULL'
 
-    # マスタと突合（媒体コードがある前提）
-    if '媒体コード' in df.columns and not master_long.empty:
+    # マスタと突合
+    if "媒体コード" in df.columns and not master_long.empty:
+        df["媒体コード"] = df["媒体コード"].map(normalize_code)
         merged_df = df.merge(master_long, on="媒体コード", how="left")
     else:
         merged_df = df.copy()
-        if '媒体名' not in merged_df.columns:
-            merged_df['媒体名'] = pd.NA
-        if 'カテゴリ' not in merged_df.columns:
-            merged_df['カテゴリ'] = pd.NA
+
+    # 後続処理で必ず参照する列を保証
+    if "媒体名" not in merged_df.columns:
+        merged_df["媒体名"] = pd.NA
+    if "カテゴリ" not in merged_df.columns:
+        merged_df["カテゴリ"] = pd.NA
 
     # -------------------------
     # ✅ フィルタUI（日付・カテゴリなど）
@@ -167,28 +212,37 @@ if uploaded_data is not None:
         filtered_df = merged_df.copy()
 
     # カテゴリフィルタ
-    category_options = ["ALL"] + sorted(filtered_df["カテゴリ"].dropna().unique().tolist())
+    category_options = ["ALL"] + sorted(filtered_df["カテゴリ"].dropna().astype(str).unique().tolist())
     selected_categories = st.sidebar.multiselect("カテゴリを選択", category_options, default=["ALL"])
     if "ALL" not in selected_categories:
-        filtered_df = filtered_df[filtered_df["カテゴリ"].isin(selected_categories)]
+        filtered_df = filtered_df[filtered_df["カテゴリ"].astype(str).isin(selected_categories)]
 
     # 媒体名フィルタ
-    company_options = ["ALL"] + sorted(filtered_df["媒体名"].dropna().unique().tolist())
+    company_options = ["ALL"] + sorted(filtered_df["媒体名"].dropna().astype(str).unique().tolist())
     selected_companies = st.sidebar.multiselect("媒体名を選択", company_options, default=["ALL"])
     if "ALL" not in selected_companies:
-        filtered_df = filtered_df[filtered_df["媒体名"].isin(selected_companies)]
+        filtered_df = filtered_df[filtered_df["媒体名"].astype(str).isin(selected_companies)]
 
     # 承認区分フィルタ
-    approval_options = ["ALL"] + sorted(filtered_df["承認区分"].dropna().unique().tolist())
+    approval_options = ["ALL"] + sorted(filtered_df["承認区分"].dropna().astype(str).unique().tolist())
     selected_approval = st.sidebar.multiselect("承認区分を選択", approval_options, default=["ALL"])
     if "ALL" not in selected_approval:
-        filtered_df = filtered_df[filtered_df["承認区分"].isin(selected_approval)]
+        filtered_df = filtered_df[filtered_df["承認区分"].astype(str).isin(selected_approval)]
 
     # 性別フィルタ
-    gender_options = ["ALL"] + sorted(filtered_df["性別"].dropna().unique().tolist())
-    selected_genders = st.sidebar.multiselect("性別を選択", gender_options, default=["ALL"])
-    if "ALL" not in selected_genders:
-        filtered_df = filtered_df[filtered_df["性別"].isin(selected_genders)]
+    if "性別" in filtered_df.columns:
+        gender_options = ["ALL"] + sorted(
+            filtered_df["性別"].dropna().astype(str).unique().tolist()
+        )
+        selected_genders = st.sidebar.multiselect(
+            "性別を選択",
+            gender_options,
+            default=["ALL"],
+        )
+        if "ALL" not in selected_genders:
+            filtered_df = filtered_df[
+                filtered_df["性別"].astype(str).isin(selected_genders)
+            ]
 
     st.write(f"件数: {len(filtered_df):,}件")
 
@@ -503,5 +557,4 @@ if uploaded_data is not None:
 else:
     # アップロードが未実施の案内
     st.info("Excelファイル（後方数値データ）をアップロードしてください。")
-
 
