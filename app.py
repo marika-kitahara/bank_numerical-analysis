@@ -62,11 +62,11 @@ if uploaded_master is not None:
 
         master_long = master_long.dropna(subset=["媒体コード"])
 
-else:
-    code_cols = [
-        col for col in master.columns
-        if col not in id_vars
-    ]
+    else:
+        code_cols = [
+            col for col in master.columns
+            if col not in id_vars
+        ]
 
     master_long = master.melt(
         id_vars=id_vars,
