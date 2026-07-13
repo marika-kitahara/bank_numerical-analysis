@@ -68,12 +68,13 @@ if uploaded_master is not None:
             if col not in id_vars
         ]
 
-    master_long = master.melt(
-        id_vars=id_vars,
-        value_vars=code_cols,
-        var_name="コード列",
-        value_name="媒体コード",
-    ).dropna(subset=["媒体コード"])
+        master_long = master.melt(
+            id_vars=id_vars,
+            value_vars=code_cols,
+            var_name="コード列",
+            value_name="媒体コード",
+        ).dropna(subset=["媒体コード"])
+    
     # 横持ち形式ならmeltする
     else:
         code_cols = [col for col in master.columns if col not in id_vars]
