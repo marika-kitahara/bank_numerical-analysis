@@ -24,16 +24,38 @@ category_orders = {
 st.sidebar.header("ファイルアップロード")
 uploaded_data = st.sidebar.file_uploader("後方数値データをアップロード", type=["xlsx"])
 
+uploaded_master = st.sidebar.file_uploader(
+    "媒体コードマスタをアップロード",
+    type=["xlsx"],
+    help="BOXから最新版をダウンロードしてアップロードしてください"
+)
+st.sidebar.markdown(
+    "[📂 媒体コードマスタはこちら](https://rak.box.com/s/ocqdd7wgeoqnymhe7lkifycmnckpyncr)"
+)
 # マスタファイル読み込み（GitHub固定）
-master_path = "媒体コードマスタ.xlsx"
-master = pd.read_excel(master_path)
-master.columns = [str(c).strip().replace('\u3000', '').replace('\xa0', '') for c in master.columns]
-master.rename(columns={"会社名": "媒体名"}, inplace=True)
+if uploaded_master is not None:
+    master = pd.read_excel(uploaded_master)
 
-id_vars = [col for col in master.columns if col in ["媒体名", "カテゴリ"]]
-code_cols = [col for col in master.columns if col not in id_vars]
-master_long = master.melt(id_vars=id_vars, value_vars=code_cols,
-                          var_name="コード列", value_name="媒体コード").dropna(subset=["媒体コード"])
+    master.columns = [
+        str(c).strip().replace('\u3000', '').replace('\xa0', '')
+        for c in master.columns
+    ]
+
+    master.rename(columns={"会社名": "媒体名"}, inplace=True)
+
+    id_vars = [col for col in master.columns if col in ["媒体名", "カテゴリ"]]
+    code_cols = [col for col in master.columns if col not in id_vars]
+
+    master_long = master.melt(
+        id_vars=id_vars,
+        value_vars=code_cols,
+        var_name="コード列",
+        value_name="媒体コード"
+    ).dropna(subset=["媒体コード"])
+
+else:
+    st.warning("媒体コードマスタをアップロードしてください。")
+    st.stop()
 
 # 後方数値データ読み込み
 if uploaded_data is not None:
