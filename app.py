@@ -219,7 +219,10 @@ if uploaded_master and uploaded_file:
             pivot = cross.pivot_table(
                 index=x, columns=y, values=metric_type, aggfunc="sum"
             )
-            st.dataframe(pivot.style.background_gradient(cmap="Blues"))
+            try:
+                st.dataframe(pivot.style.background_gradient(cmap="Blues"))
+            except ImportError:
+                st.dataframe(pivot)
 
             st.subheader(f"📈 日次推移（{x}別）")
 
