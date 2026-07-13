@@ -1,0 +1,5 @@
+python-pptx
+plotly
+pandas
+openpyxl
+kaleido   # Plotly画像出力用
