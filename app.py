@@ -37,15 +37,23 @@ if uploaded_master is not None:
     master = pd.read_excel(uploaded_master)
 
     master.columns = [
-        str(c).strip().replace('\u3000', '').replace('\xa0', '')
+        str(c).strip().replace("\u3000", "").replace("\xa0", "")
         for c in master.columns
     ]
 
-    master.rename(columns={"会社名": "媒体名"}, inplace=True)
+    master.rename(
+        columns={
+            "会社名": "媒体名",
+            "メニューコード": "カテゴリ",
+        },
+        inplace=True,
+    )
 
-    id_vars = [col for col in master.columns if col in ["媒体名", "カテゴリ"]]
+    id_vars = [
+        col for col in ["媒体名", "カテゴリ"]
+        if col in master.columns
+    ]
 
-    # すでに「媒体コード」列がある形式なら、そのまま使う
     if "媒体コード" in master.columns:
         master_long = master[
             [col for col in ["媒体名", "カテゴリ", "媒体コード"]
@@ -54,6 +62,18 @@ if uploaded_master is not None:
 
         master_long = master_long.dropna(subset=["媒体コード"])
 
+else:
+    code_cols = [
+        col for col in master.columns
+        if col not in id_vars
+    ]
+
+    master_long = master.melt(
+        id_vars=id_vars,
+        value_vars=code_cols,
+        var_name="コード列",
+        value_name="媒体コード",
+    ).dropna(subset=["媒体コード"])
     # 横持ち形式ならmeltする
     else:
         code_cols = [col for col in master.columns if col not in id_vars]
