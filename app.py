@@ -124,13 +124,27 @@ master_long["媒体コード"] = master_long["媒体コード"].map(normalize_co
 master_long["媒体名"] = master_long["媒体名"].astype("string").str.strip()
 master_long["カテゴリ"] = master_long["カテゴリ"].astype("string").str.strip()
 
+# マスタ側は媒体コード1つにつき1行にする
 master_long = (
     master_long
     .dropna(subset=["媒体コード"])
     .loc[lambda df_: df_["媒体コード"].astype(str).str.strip() != ""]
-    .drop_duplicates(subset=["媒体コード", "媒体名", "カテゴリ"])
+    .drop_duplicates(subset=["媒体コード"], keep="first")
     .reset_index(drop=True)
 )
+
+# 後方数値データと突合
+if "媒体コード" in df.columns and not master_long.empty:
+    df["媒体コード"] = df["媒体コード"].map(normalize_code)
+
+    merged_df = df.merge(
+        master_long,
+        on="媒体コード",
+        how="left",
+        validate="many_to_one",
+    )
+else:
+    merged_df = df.copy()
 
 # 後方数値データ読み込み
 if uploaded_data is not None:
