@@ -1,32 +1,502 @@
-import streamlit as st
+import io
+from datetime import date
+
 import pandas as pd
 import plotly.graph_objects as go
-from datetime import date
+import streamlit as st
+
 
 # ----------------------------------------------------
 # ページ設定
 # ----------------------------------------------------
-st.set_page_config(page_title="後方数値データ分析", layout="wide")
+st.set_page_config(
+    page_title="後方数値データ分析",
+    layout="wide",
+)
 st.title("📊 後方数値データ分析ダッシュボード")
 
+
 # ----------------------------------------------------
-# カテゴリ順序定義
+# 定数
 # ----------------------------------------------------
-category_orders = {
-    "年収帯": ['0-499', '500-999', '1000以上'],
-    "借入希望額帯": ['0', '1-9', '10-19', '20-29', '30-39', '40-49', '50-59', '60-69', '70-79', '80-89', '90-99', '100-199', '200-299', '300以上'],
-    "住宅ローン帯": ['0', '1-9', '10-19', '20-29', '30-39', '40-49', '50-59', '60-69', '70-79', '80-89', '90-99', '100以上'],
-    "勤続年数帯": ['0', '1-3', '4-9', '10-20', '21以上']
+MASTER_BOX_URL = "https://rak.box.com/s/ocqdd7wgeoqnymhe7lkifycmnckpyncr"
+
+CATEGORY_ORDERS = {
+    "年収帯": ["0-499", "500-999", "1000以上"],
+    "借入希望額帯": [
+        "0", "1-9", "10-19", "20-29", "30-39", "40-49",
+        "50-59", "60-69", "70-79", "80-89", "90-99",
+        "100-199", "200-299", "300以上",
+    ],
+    "住宅ローン帯": [
+        "0", "1-9", "10-19", "20-29", "30-39", "40-49",
+        "50-59", "60-69", "70-79", "80-89", "90-99", "100以上",
+    ],
+    "勤続年数帯": ["0", "1-3", "4-9", "10-20", "21以上"],
 }
 
-# サイドバー：ファイルアップロード
-st.sidebar.header("ファイルアップロード")
+AMOUNT_COLS = [
+    "取扱金額_申込当月",
+    "取扱金額_申込翌月末",
+    "取扱金額_申込翌々月末",
+]
 
-uploaded_data = st.sidebar.file_uploader(
-    "後方数値データをアップロード",
-    type=["xlsx"],
-    key="uploaded_data",
-)
+NUMERIC_COLS = [
+    "年齢",
+    "年収",
+    "同借希望額",
+    "住宅ローン返済月額",
+    "勤続年数",
+    "他社借入件数",
+    *AMOUNT_COLS,
+]
+
+CHART_OPTIONS = {
+    "性別": "性別",
+    "年齢": "年齢",
+    "年収": "年収帯",
+    "都道府県": "都道府県",
+    "利用目的": "利用目的",
+    "同借希望額": "借入希望額帯",
+    "家族構成": "家族構成",
+    "子供数": "子供数",
+    "住宅ローン返済月額": "住宅ローン帯",
+    "勤務状況": "勤務状況",
+    "勤続年数": "勤続年数帯",
+    "他社借入件数": "他社借入件数",
+    "媒体名": "媒体名",
+    "承認区分": "承認区分",
+}
+
+PIVOT_CANDIDATES = [
+    "性別",
+    "年齢",
+    "年収帯",
+    "都道府県",
+    "利用目的",
+    "借入希望額帯",
+    "家族構成",
+    "子供数",
+    "住宅ローン帯",
+    "勤務状況",
+    "勤続年数帯",
+    "他社借入件数",
+    "媒体名",
+    "カテゴリ",
+    "承認区分",
+]
+
+
+# ----------------------------------------------------
+# 共通関数
+# ----------------------------------------------------
+def normalize_column_name(value) -> str:
+    return (
+        str(value)
+        .strip()
+        .replace("\u3000", "")
+        .replace("\xa0", "")
+    )
+
+
+def normalize_code(value):
+    if pd.isna(value):
+        return pd.NA
+
+    if isinstance(value, float) and value.is_integer():
+        return str(int(value))
+
+    text = str(value).strip()
+
+    if text.endswith(".0"):
+        text = text[:-2]
+
+    return text if text else pd.NA
+
+
+def group_age_10(value) -> str:
+    if pd.isna(value):
+        return "不明"
+
+    try:
+        number = int(float(value))
+    except (TypeError, ValueError):
+        return "不明"
+
+    if number < 10:
+        return "0-9"
+    if number < 20:
+        return "10-19"
+    if number < 30:
+        return "20-29"
+    if number < 40:
+        return "30-39"
+    if number < 50:
+        return "40-49"
+    if number < 60:
+        return "50-59"
+    if number < 70:
+        return "60-69"
+    if number < 80:
+        return "70-79"
+    if number < 90:
+        return "80-89"
+    return "90以上"
+
+
+def group_income(value) -> str:
+    if pd.isna(value):
+        return "不明"
+    if value < 500:
+        return "0-499"
+    if value < 1000:
+        return "500-999"
+    return "1000以上"
+
+
+def group_loan(value) -> str:
+    if pd.isna(value):
+        return "不明"
+    if value == 0:
+        return "0"
+    if value < 10:
+        return "1-9"
+    if value < 20:
+        return "10-19"
+    if value < 30:
+        return "20-29"
+    if value < 40:
+        return "30-39"
+    if value < 50:
+        return "40-49"
+    if value < 60:
+        return "50-59"
+    if value < 70:
+        return "60-69"
+    if value < 80:
+        return "70-79"
+    if value < 90:
+        return "80-89"
+    if value < 100:
+        return "90-99"
+    if value < 200:
+        return "100-199"
+    if value < 300:
+        return "200-299"
+    return "300以上"
+
+
+def group_mortgage(value) -> str:
+    if pd.isna(value):
+        return "不明"
+    if value == 0:
+        return "0"
+    if value < 10:
+        return "1-9"
+    if value < 20:
+        return "10-19"
+    if value < 30:
+        return "20-29"
+    if value < 40:
+        return "30-39"
+    if value < 50:
+        return "40-49"
+    if value < 60:
+        return "50-59"
+    if value < 70:
+        return "60-69"
+    if value < 80:
+        return "70-79"
+    if value < 90:
+        return "80-89"
+    if value < 100:
+        return "90-99"
+    return "100以上"
+
+
+def group_years(value) -> str:
+    if pd.isna(value):
+        return "不明"
+    if value == 0:
+        return "0"
+    if value <= 3:
+        return "1-3"
+    if value <= 9:
+        return "4-9"
+    if value <= 20:
+        return "10-20"
+    return "21以上"
+
+
+@st.cache_data(show_spinner="媒体コードマスタを読み込んでいます...")
+def read_master(file_bytes: bytes) -> pd.DataFrame:
+    master = pd.read_excel(io.BytesIO(file_bytes))
+    master.columns = [normalize_column_name(col) for col in master.columns]
+
+    master.rename(
+        columns={
+            "会社名": "媒体名",
+            "メニューコード": "カテゴリ",
+        },
+        inplace=True,
+    )
+
+    required = ["媒体名", "カテゴリ"]
+    missing = [col for col in required if col not in master.columns]
+
+    if missing:
+        raise ValueError(
+            "媒体コードマスタに必要な列がありません："
+            + "、".join(missing)
+        )
+
+    # 縦持ち形式
+    if "媒体コード" in master.columns:
+        master_long = master[
+            ["媒体名", "カテゴリ", "媒体コード"]
+        ].copy()
+
+    # 横持ち形式
+    else:
+        id_vars = ["媒体名", "カテゴリ"]
+
+        # コード列候補だけを対象にする。
+        # まず列名に「コード」を含む列を優先。
+        code_cols = [
+            col for col in master.columns
+            if col not in id_vars and "コード" in str(col)
+        ]
+
+        # 見つからない場合のみ、従来どおりID列以外を対象にする。
+        if not code_cols:
+            code_cols = [
+                col for col in master.columns
+                if col not in id_vars
+            ]
+
+        if not code_cols:
+            raise ValueError(
+                "媒体コードとして使用できる列が見つかりませんでした。"
+            )
+
+        master_long = master.melt(
+            id_vars=id_vars,
+            value_vars=code_cols,
+            var_name="コード列",
+            value_name="媒体コード",
+        )
+
+    master_long["媒体コード"] = master_long["媒体コード"].map(
+        normalize_code
+    )
+    master_long["媒体名"] = (
+        master_long["媒体名"]
+        .astype("string")
+        .str.strip()
+    )
+    master_long["カテゴリ"] = (
+        master_long["カテゴリ"]
+        .astype("string")
+        .str.strip()
+    )
+
+    master_long = (
+        master_long
+        .dropna(subset=["媒体コード"])
+        .drop_duplicates(subset=["媒体コード"], keep="first")
+        .reset_index(drop=True)
+    )
+
+    return master_long
+
+
+@st.cache_data(show_spinner="後方数値データを読み込んでいます...")
+def read_data(file_bytes: bytes) -> pd.DataFrame:
+    df = pd.read_excel(io.BytesIO(file_bytes))
+    df.columns = [normalize_column_name(col) for col in df.columns]
+
+    if "媒体コード" in df.columns:
+        df["媒体コード"] = df["媒体コード"].map(normalize_code)
+
+    if "性別" in df.columns:
+        original_gender = df["性別"].astype("string")
+        extracted_gender = original_gender.str.extract(
+            r"_(男性|女性)",
+            expand=False,
+        )
+        df["性別"] = extracted_gender.fillna(original_gender)
+
+    for col in NUMERIC_COLS:
+        if col in df.columns:
+            df[col] = pd.to_numeric(df[col], errors="coerce")
+
+    if "申込日" in df.columns:
+        df["申込日"] = pd.to_datetime(
+            df["申込日"],
+            errors="coerce",
+        )
+
+    for col in AMOUNT_COLS:
+        if col not in df.columns:
+            df[col] = 0
+
+    df["取扱高"] = df[AMOUNT_COLS].sum(axis=1)
+
+    if "承認区分" in df.columns:
+        df["承認区分"] = df["承認区分"].fillna("NULL")
+    else:
+        df["承認区分"] = "NULL"
+
+    return df
+
+
+def add_group_columns(df: pd.DataFrame) -> pd.DataFrame:
+    result = df.copy()
+
+    if "年齢" in result.columns:
+        result["年齢"] = result["年齢"].map(group_age_10)
+
+    if "年収" in result.columns:
+        result["年収帯"] = result["年収"].map(group_income)
+
+    if "同借希望額" in result.columns:
+        result["借入希望額帯"] = result["同借希望額"].map(group_loan)
+
+    if "住宅ローン返済月額" in result.columns:
+        result["住宅ローン帯"] = result[
+            "住宅ローン返済月額"
+        ].map(group_mortgage)
+
+    if "勤続年数" in result.columns:
+        result["勤続年数帯"] = result["勤続年数"].map(group_years)
+
+    return result
+
+
+def filter_multiselect(
+    df: pd.DataFrame,
+    column: str,
+    label: str,
+) -> pd.DataFrame:
+    if column not in df.columns:
+        return df
+
+    options = sorted(
+        df[column]
+        .dropna()
+        .astype(str)
+        .unique()
+        .tolist()
+    )
+
+    selected = st.sidebar.multiselect(
+        label,
+        ["ALL", *options],
+        default=["ALL"],
+        key=f"filter_{column}",
+    )
+
+    if "ALL" in selected:
+        return df
+
+    return df[df[column].astype(str).isin(selected)].copy()
+
+
+def create_dual_axis_chart(
+    df: pd.DataFrame,
+    category_col: str,
+    title: str,
+) -> go.Figure:
+    if (
+        category_col not in df.columns
+        or df[category_col].dropna().empty
+    ):
+        return go.Figure()
+
+    if category_col in CATEGORY_ORDERS:
+        order = CATEGORY_ORDERS[category_col]
+        count_data = (
+            df[category_col]
+            .value_counts()
+            .reindex(order)
+            .fillna(0)
+        )
+        sum_data = (
+            df.groupby(category_col, dropna=False)["取扱高"]
+            .sum()
+            .reindex(order)
+            .fillna(0)
+        )
+    else:
+        count_data = (
+            df[category_col]
+            .astype("string")
+            .value_counts()
+            .sort_index()
+        )
+        sum_data = (
+            df.groupby(category_col, dropna=False)["取扱高"]
+            .sum()
+            .reindex(count_data.index)
+            .fillna(0)
+        )
+
+    fig = go.Figure()
+
+    fig.add_trace(
+        go.Bar(
+            x=count_data.index.astype(str),
+            y=count_data.values,
+            name="件数",
+            offsetgroup=0,
+            yaxis="y",
+        )
+    )
+
+    fig.add_trace(
+        go.Bar(
+            x=sum_data.index.astype(str),
+            y=sum_data.values,
+            name="取扱高（円）",
+            offsetgroup=1,
+            yaxis="y2",
+        )
+    )
+
+    fig.update_layout(
+        title=f"{title}（件数＋取扱高）",
+        xaxis={"title": category_col},
+        yaxis={"title": "件数", "side": "left"},
+        yaxis2={
+            "title": "取扱高（円）",
+            "overlaying": "y",
+            "side": "right",
+        },
+        barmode="group",
+        legend={
+            "orientation": "h",
+            "yanchor": "bottom",
+            "y": 1.02,
+            "xanchor": "right",
+            "x": 1,
+        },
+    )
+
+    return fig
+
+
+def to_1d_str(series: pd.Series) -> pd.Series:
+    return series.apply(
+        lambda value: value[0]
+        if isinstance(value, (list, tuple))
+        else value
+    ).astype(str)
+
+
+# ----------------------------------------------------
+# サイドバー：アップロード
+# ----------------------------------------------------
+st.sidebar.header("ファイルアップロード")
 
 uploaded_master = st.sidebar.file_uploader(
     "媒体コードマスタをアップロード",
@@ -36,539 +506,379 @@ uploaded_master = st.sidebar.file_uploader(
 )
 
 st.sidebar.markdown(
-    "[📂 媒体コードマスタはこちら]"
-    "(https://rak.box.com/s/ocqdd7wgeoqnymhe7lkifycmnckpyncr)"
+    f"[📂 媒体コードマスタはこちら]({MASTER_BOX_URL})"
 )
 
+uploaded_data = st.sidebar.file_uploader(
+    "後方数値データをアップロード",
+    type=["xlsx"],
+    key="uploaded_data",
+)
 
-def normalize_column_name(value):
-    """Excel列名の前後空白・全角空白・NBSPを除去する。"""
-    return str(value).strip().replace("\u3000", "").replace("\xa0", "")
-
-
-def normalize_code(value):
-    """媒体コードを突合しやすい文字列へ統一する。"""
-    if pd.isna(value):
-        return pd.NA
-
-    if isinstance(value, float) and value.is_integer():
-        return str(int(value))
-
-    text_value = str(value).strip()
-
-    if text_value.endswith(".0"):
-        text_value = text_value[:-2]
-
-    return text_value
-
-
-# ----------------------------------------------------
-# 媒体コードマスタ読み込み
-# ----------------------------------------------------
-if uploaded_master is None:
-    st.info("媒体コードマスタをアップロードしてください。")
+if uploaded_master is None or uploaded_data is None:
+    st.info(
+        "媒体コードマスタと後方数値データを"
+        "アップロードしてください。"
+    )
     st.stop()
 
+
+# ----------------------------------------------------
+# 読み込み・突合
+# ----------------------------------------------------
 try:
-    master = pd.read_excel(uploaded_master)
+    master_long = read_master(uploaded_master.getvalue())
 except Exception as exc:
     st.error(f"媒体コードマスタの読み込みに失敗しました：{exc}")
     st.stop()
 
-master.columns = [normalize_column_name(col) for col in master.columns]
-
-# 実ファイルの列名を、アプリ内で使う共通名へ変換
-master.rename(
-    columns={
-        "会社名": "媒体名",
-        "メニューコード": "カテゴリ",
-    },
-    inplace=True,
-)
-
-required_master_columns = ["媒体名", "カテゴリ"]
-missing_master_columns = [
-    col for col in required_master_columns if col not in master.columns
-]
-
-if missing_master_columns:
-    st.error(
-        "媒体コードマスタに必要な列がありません："
-        + "、".join(missing_master_columns)
-    )
-    st.write("読み込んだ列名：", master.columns.tolist())
+try:
+    df = read_data(uploaded_data.getvalue())
+except Exception as exc:
+    st.error(f"後方数値データの読み込みに失敗しました：{exc}")
     st.stop()
 
-# すでに「媒体コード」列がある縦持ち形式と、
-# 複数のコード列を持つ横持ち形式の両方に対応
-if "媒体コード" in master.columns:
-    master_long = master[
-        ["媒体名", "カテゴリ", "媒体コード"]
-    ].copy()
-else:
-    id_vars = ["媒体名", "カテゴリ"]
-    code_cols = [col for col in master.columns if col not in id_vars]
-
-    if not code_cols:
-        st.error("媒体コードとして使用できる列が見つかりませんでした。")
-        st.stop()
-
-    master_long = master.melt(
-        id_vars=id_vars,
-        value_vars=code_cols,
-        var_name="コード列",
-        value_name="媒体コード",
-    )
-
-master_long["媒体コード"] = master_long["媒体コード"].map(normalize_code)
-master_long["媒体名"] = master_long["媒体名"].astype("string").str.strip()
-master_long["カテゴリ"] = master_long["カテゴリ"].astype("string").str.strip()
-
-# マスタ側は媒体コード1つにつき1行にする
-master_long = (
-    master_long
-    .dropna(subset=["媒体コード"])
-    .loc[lambda df_: df_["媒体コード"].astype(str).str.strip() != ""]
-    .drop_duplicates(subset=["媒体コード"], keep="first")
-    .reset_index(drop=True)
-)
-
-# 後方数値データと突合
 if "媒体コード" in df.columns and not master_long.empty:
-    df["媒体コード"] = df["媒体コード"].map(normalize_code)
-
-    merged_df = df.merge(
-        master_long,
-        on="媒体コード",
-        how="left",
-        validate="many_to_one",
-    )
+    try:
+        merged_df = df.merge(
+            master_long,
+            on="媒体コード",
+            how="left",
+            validate="many_to_one",
+        )
+    except Exception as exc:
+        st.error(f"媒体コードマスタとの突合に失敗しました：{exc}")
+        st.stop()
 else:
     merged_df = df.copy()
 
-# 後方数値データ読み込み
-if uploaded_data is not None:
-    # 後方数値データ読み込み
-    df = pd.read_excel(uploaded_data)
-    df.columns = [str(c).strip().replace('\u3000', '').replace('\xa0', '') for c in df.columns]
+if "媒体名" not in merged_df.columns:
+    merged_df["媒体名"] = pd.NA
 
-    # 性別整形（例：'xxx_男性' → '男性'）
-    if '性別' in df.columns:
-        df['性別'] = df['性別'].astype(str).str.extract(r'_(男性|女性)', expand=False).fillna(df['性別'])
+if "カテゴリ" not in merged_df.columns:
+    merged_df["カテゴリ"] = pd.NA
 
-    # 数値列変換（存在チェック付き）
-    numeric_cols = [
-        '年齢', '年収', '同借希望額', '住宅ローン返済月額', '勤続年数',
-        '他社借入件数', '取扱金額_申込当月', '取扱金額_申込翌月末', '取扱金額_申込翌々月末'
-    ]
-    for col in numeric_cols:
-        if col in df.columns:
-            df[col] = pd.to_numeric(df[col], errors='coerce')
 
-    # 申込日 → datetime
-    if '申込日' in df.columns:
-        df['申込日'] = pd.to_datetime(df['申込日'], errors='coerce')
+# ----------------------------------------------------
+# フィルタ
+# ----------------------------------------------------
+st.sidebar.header("フィルタ設定")
 
-    # 取扱高計算（不足列は0で補完）
-    amount_cols = ['取扱金額_申込当月', '取扱金額_申込翌月末', '取扱金額_申込翌々月末']
-    for c in amount_cols:
-        if c not in df.columns:
-            df[c] = 0
-    df['取扱高'] = df[amount_cols].sum(axis=1)
+filtered_df = merged_df.copy()
 
-    # 承認区分のNULL処理
-    if '承認区分' in df.columns:
-        df['承認区分'] = df['承認区分'].fillna('NULL')
+if "申込日" in filtered_df.columns:
+    date_series = filtered_df["申込日"].dropna()
+
+    if date_series.empty:
+        today = date.today()
+        default_start = today
+        default_end = today
     else:
-        df['承認区分'] = 'NULL'
+        default_start = date_series.min().date()
+        default_end = date_series.max().date()
 
-    # マスタと突合
-    if "媒体コード" in df.columns and not master_long.empty:
-        df["媒体コード"] = df["媒体コード"].map(normalize_code)
-        merged_df = df.merge(master_long, on="媒体コード", how="left")
-    else:
-        merged_df = df.copy()
-
-    # 後続処理で必ず参照する列を保証
-    if "媒体名" not in merged_df.columns:
-        merged_df["媒体名"] = pd.NA
-    if "カテゴリ" not in merged_df.columns:
-        merged_df["カテゴリ"] = pd.NA
-
-    # -------------------------
-    # ✅ フィルタUI（日付・カテゴリなど）
-    # -------------------------
-    st.sidebar.header("フィルタ設定")
-
-    # 日付範囲のデフォルト（NaT除去）
-    if '申込日' in merged_df.columns:
-        date_series = merged_df['申込日'].dropna()
-        if not date_series.empty:
-            default_start = date_series.min().date()
-            default_end = date_series.max().date()
-        else:
-            today = date.today()
-            default_start, default_end = today, today
-        date_range = st.sidebar.date_input("申込日範囲", (default_start, default_end))
-        # 単一選択にも対応
-        if isinstance(date_range, tuple) and len(date_range) == 2:
-            start_date, end_date = date_range
-        else:
-            start_date = date_range
-            end_date = date_range
-
-        filtered_df = merged_df[
-            (merged_df['申込日'] >= pd.to_datetime(start_date)) &
-            (merged_df['申込日'] <= pd.to_datetime(end_date))
-        ].copy()
-    else:
-        st.sidebar.info("データに『申込日』列がないため、日付フィルタは無効です。")
-        filtered_df = merged_df.copy()
-
-    # カテゴリフィルタ
-    category_options = ["ALL"] + sorted(filtered_df["カテゴリ"].dropna().astype(str).unique().tolist())
-    selected_categories = st.sidebar.multiselect("カテゴリを選択", category_options, default=["ALL"])
-    if "ALL" not in selected_categories:
-        filtered_df = filtered_df[filtered_df["カテゴリ"].astype(str).isin(selected_categories)]
-
-    # 媒体名フィルタ
-    company_options = ["ALL"] + sorted(filtered_df["媒体名"].dropna().astype(str).unique().tolist())
-    selected_companies = st.sidebar.multiselect("媒体名を選択", company_options, default=["ALL"])
-    if "ALL" not in selected_companies:
-        filtered_df = filtered_df[filtered_df["媒体名"].astype(str).isin(selected_companies)]
-
-    # 承認区分フィルタ
-    approval_options = ["ALL"] + sorted(filtered_df["承認区分"].dropna().astype(str).unique().tolist())
-    selected_approval = st.sidebar.multiselect("承認区分を選択", approval_options, default=["ALL"])
-    if "ALL" not in selected_approval:
-        filtered_df = filtered_df[filtered_df["承認区分"].astype(str).isin(selected_approval)]
-
-    # 性別フィルタ
-    if "性別" in filtered_df.columns:
-        gender_options = ["ALL"] + sorted(
-            filtered_df["性別"].dropna().astype(str).unique().tolist()
-        )
-        selected_genders = st.sidebar.multiselect(
-            "性別を選択",
-            gender_options,
-            default=["ALL"],
-        )
-        if "ALL" not in selected_genders:
-            filtered_df = filtered_df[
-                filtered_df["性別"].astype(str).isin(selected_genders)
-            ]
-
-    st.write(f"件数: {len(filtered_df):,}件")
-
-    # -------------------------
-    # ✅ データ整形（年齢・年収帯など）
-    # -------------------------
-    def group_age_10(x):
-        if pd.isna(x): return "不明"
-        try:
-            xi = int(float(x))
-        except Exception:
-            return "不明"
-        if xi < 10: return "0-9"
-        elif xi < 20: return "10-19"
-        elif xi < 30: return "20-29"
-        elif xi < 40: return "30-39"
-        elif xi < 50: return "40-49"
-        elif xi < 60: return "50-59"
-        elif xi < 70: return "60-69"
-        elif xi < 80: return "70-79"
-        elif xi < 90: return "80-89"
-        else: return "90以上"
-
-    def group_income(x):
-        if pd.isna(x): return "不明"
-        return "0-499" if x < 500 else ("500-999" if x < 1000 else "1000以上")
-
-    def group_loan(x):
-        if pd.isna(x): return "不明"
-        if x == 0: return "0"
-        elif x < 10: return "1-9"
-        elif x < 20: return "10-19"
-        elif x < 30: return "20-29"
-        elif x < 40: return "30-39"
-        elif x < 50: return "40-49"
-        elif x < 60: return "50-59"
-        elif x < 70: return "60-69"
-        elif x < 80: return "70-79"
-        elif x < 90: return "80-89"
-        elif x < 100: return "90-99"
-        elif x < 200: return "100-199"
-        elif x < 300: return "200-299"
-        else: return "300以上"
-
-    def group_mortgage(x):
-        if pd.isna(x): return "不明"
-        if x == 0: return "0"
-        elif x < 10: return "1-9"
-        elif x < 20: return "10-19"
-        elif x < 30: return "20-29"
-        elif x < 40: return "30-39"
-        elif x < 50: return "40-49"
-        elif x < 60: return "50-59"
-        elif x < 70: return "60-69"
-        elif x < 80: return "70-79"
-        elif x < 90: return "80-89"
-        elif x < 100: return "90-99"
-        else: return "100以上"
-
-    def group_years(x):
-        if pd.isna(x): return "不明"
-        if x == 0: return "0"
-        elif x <= 3: return "1-3"
-        elif x <= 9: return "4-9"
-        elif x <= 20: return "10-20"
-        else: return "21以上"
-
-    if '年齢' in filtered_df.columns:
-        filtered_df['年齢'] = filtered_df['年齢'].apply(group_age_10)
-    if '年収' in filtered_df.columns:
-        filtered_df['年収帯'] = filtered_df['年収'].apply(group_income)
-    if '同借希望額' in filtered_df.columns:
-        filtered_df['借入希望額帯'] = filtered_df['同借希望額'].apply(group_loan)
-    if '住宅ローン返済月額' in filtered_df.columns:
-        filtered_df['住宅ローン帯'] = filtered_df['住宅ローン返済月額'].apply(group_mortgage)
-    if '勤続年数' in filtered_df.columns:
-        filtered_df['勤続年数帯'] = filtered_df['勤続年数'].apply(group_years)
-
-    # -------------------------
-    # ✅ フィルタ後データテーブル＋CSV
-    # -------------------------
-    st.subheader("📋 フィルタ後データ一覧")
-    display_cols = []
-    if "媒体コード" in filtered_df.columns:
-        display_cols.append("媒体コード")
-    if "媒体名" in filtered_df.columns:
-        display_cols.append("媒体名")
-    # 先頭に媒体コード/媒体名を置いて残りを続ける
-    display_cols += [col for col in filtered_df.columns if col not in display_cols]
-    st.dataframe(filtered_df[display_cols], use_container_width=True)
-
-    csv = filtered_df.to_csv(index=False).encode('utf-8-sig')
-    st.download_button(
-        label="フィルタ後データCSVをダウンロード",
-        data=csv,
-        file_name="filtered_data.csv",
-        mime="text/csv"
+    date_range = st.sidebar.date_input(
+        "申込日範囲",
+        value=(default_start, default_end),
     )
 
-    # -------------------------
-    # ✅ 承認率一覧＋CSVエクスポート
-    # -------------------------
-    if "媒体名" in filtered_df.columns:
-        st.subheader("📌 媒体別 承認率一覧（降順）")
-        approval_summary = (
-            filtered_df.groupby("媒体名", dropna=False)
-            .apply(lambda x: pd.Series({
-                "件数": len(x),
-                "承認件数": (x["承認区分"] == "承認").sum(),
-                "承認率(%)": round(((x["承認区分"] == "承認").sum() / len(x) * 100), 2) if len(x) else 0.0
-            }))
-            .reset_index()
-            .sort_values(by="承認率(%)", ascending=False)
-        )
-        st.dataframe(approval_summary, use_container_width=True)
-
-        csv_approval = approval_summary.to_csv(index=False).encode('utf-8-sig')
-        st.download_button(
-            label="承認率一覧CSVをダウンロード",
-            data=csv_approval,
-            file_name="approval_summary.csv",
-            mime="text/csv"
-        )
-
-    # -------------------------
-    # ✅ グラフ表示（件数＋取扱高のみ）
-    # -------------------------
-    st.subheader("📈 項目別インタラクティブグラフ")
-    chart_cols = [
-        ("性別", "性別"),
-        ("年齢", "年齢"),
-        ("年収", "年収帯"),
-        ("都道府県", "都道府県"),
-        ("利用目的", "利用目的"),
-        ("同借希望額", "借入希望額帯"),
-        ("家族構成", "家族構成"),
-        ("子供数", "子供数"),
-        ("住宅ローン返済月額", "住宅ローン帯"),
-        ("勤務状況", "勤務状況"),
-        ("勤続年数", "勤続年数帯"),
-        ("他社借入件数", "他社借入件数"),
-        ("媒体名", "媒体名"),
-        ("承認区分", "承認区分")
-    ]
-
-    def create_dual_axis_grouped_chart(df, category_col, title):
-        # カラム存在＆非空チェック
-        if category_col not in df.columns or df[category_col].dropna().shape[0] == 0:
-            return go.Figure()
-
-        # カテゴリ順序対応
-        if category_col in category_orders:
-            ordered_categories = category_orders[category_col]
-            count_data = df[category_col].value_counts().reindex(ordered_categories).fillna(0)
-            sum_data = df.groupby(category_col)['取扱高'].sum().reindex(ordered_categories).fillna(0)
-        else:
-            count_data = df[category_col].value_counts().sort_index()
-            sum_data = df.groupby(category_col)['取扱高'].sum().reindex(count_data.index).fillna(0)
-
-        fig = go.Figure()
-        fig.add_trace(go.Bar(
-            x=count_data.index,
-            y=count_data.values,
-            name="件数",
-            marker_color="skyblue",
-            offsetgroup=0,
-            yaxis="y"
-        ))
-        fig.add_trace(go.Bar(
-            x=sum_data.index,
-            y=sum_data.values,
-            name="取扱高（円）",
-            marker_color="orange",
-            offsetgroup=1,
-            yaxis="y2"
-        ))
-        fig.update_layout(
-            title=f"{title}（件数＋取扱高）",
-            xaxis=dict(title=category_col),
-            yaxis=dict(title="件数", side="left"),
-            yaxis2=dict(title="取扱高（円）", overlaying="y", side="right"),
-            barmode="group",
-            legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1)
-        )
-        return fig
-
-    for title, col in chart_cols:
-        if col in filtered_df.columns and filtered_df[col].dropna().shape[0] > 0:
-            fig = create_dual_axis_grouped_chart(filtered_df, col, title)
-            st.plotly_chart(fig, use_container_width=True)
-
-    # -------------------------
-    # ✅ クロス集計（ピボット）
-    # -------------------------
-    st.subheader("🧮 クロス集計（ピボット）")
-
-    df_pivot_base = filtered_df.copy()
-    # 重複列名の除去
-    df_pivot_base = df_pivot_base.loc[:, ~pd.Index(df_pivot_base.columns).duplicated()]
-    # MultiIndexのフラット化（保険）
-    df_pivot_base.columns = [
-        "_".join(map(str, c)) if isinstance(c, tuple) else str(c)
-        for c in df_pivot_base.columns
-    ]
-
-    # 取扱高が無い場合でも動くように補完
-    if "取扱高" not in df_pivot_base.columns:
-        df_pivot_base["取扱高"] = 0
-
-    # リスト/タプルが紛れているセルを 1次元化し、カテゴリを文字列化
-    def to_1d_str(s: pd.Series) -> pd.Series:
-        return s.apply(lambda v: v[0] if isinstance(v, (list, tuple)) else v).astype(str)
-
-    pivot_candidates = [
-        "性別", "年齢", "年収帯", "都道府県", "利用目的", "借入希望額帯",
-        "家族構成", "子供数", "住宅ローン帯", "勤務状況", "勤続年数帯",
-        "他社借入件数", "媒体名", "承認区分"
-    ]
-    available = [c for c in pivot_candidates if c in df_pivot_base.columns]
-
-    if not available:
-        st.warning("ピボット可能な項目が見つかりません。")
+    if isinstance(date_range, (list, tuple)) and len(date_range) == 2:
+        start_date, end_date = date_range
     else:
-        row_dim = st.selectbox("行（Row）", available, index=0)
-        col_dim = st.selectbox("列（Column）", ["（なし）"] + available, index=1 if len(available) > 1 else 0)
-        value_metric = st.selectbox("値（Value）", ["件数", "取扱高合計"], index=0)
-        show_percent = st.checkbox("行方向の構成比（%）を表示", value=False)
+        start_date = date_range
+        end_date = date_range
 
-        # 選択列を 1次元の文字列に揃える
-        df_pivot_base[row_dim] = to_1d_str(df_pivot_base[row_dim])
-        if col_dim != "（なし）":
-            df_pivot_base[col_dim] = to_1d_str(df_pivot_base[col_dim])
+    filtered_df = filtered_df[
+        filtered_df["申込日"].between(
+            pd.to_datetime(start_date),
+            pd.to_datetime(end_date),
+            inclusive="both",
+        )
+    ].copy()
 
-        try:
-            if value_metric == "件数":
-                if col_dim == "（なし）":
-                    # 単純集計（行のみ）
-                    result = (
-                        df_pivot_base.groupby(row_dim, dropna=False)
-                        .size()
-                        .reset_index(name="件数")
-                        .sort_values(by=row_dim)
-                    )
-                    if show_percent:
-                        total = result["件数"].sum()
-                        result["構成比(%)"] = (result["件数"] / total * 100).round(2) if total else 0.0
-                    st.dataframe(result, use_container_width=True)
-                    csv_bytes = result.to_csv(index=False).encode("utf-8-sig")
-                else:
-                    # 行 × 列のクロス集計（件数）
-                    ct = pd.crosstab(
-                        df_pivot_base[row_dim],
-                        df_pivot_base[col_dim],
-                        dropna=False
-                    )
-                    if show_percent:
-                        denom = ct.sum(axis=1).replace(0, pd.NA)
-                        ct_percent = (ct.div(denom, axis=0) * 100).round(2).fillna(0)
-                        st.write("行方向の構成比（%）")
-                        st.dataframe(ct_percent, use_container_width=True)
-                        csv_bytes = ct_percent.reset_index().to_csv(index=False).encode("utf-8-sig")
-                    else:
-                        st.dataframe(ct, use_container_width=True)
-                        csv_bytes = ct.reset_index().to_csv(index=False).encode("utf-8-sig")
+filtered_df = filter_multiselect(
+    filtered_df,
+    "カテゴリ",
+    "カテゴリを選択",
+)
+filtered_df = filter_multiselect(
+    filtered_df,
+    "媒体名",
+    "媒体名を選択",
+)
+filtered_df = filter_multiselect(
+    filtered_df,
+    "承認区分",
+    "承認区分を選択",
+)
+filtered_df = filter_multiselect(
+    filtered_df,
+    "性別",
+    "性別を選択",
+)
 
-            else:  # 取扱高合計
-                df_pivot_base["取扱高合計"] = pd.to_numeric(df_pivot_base["取扱高"], errors="coerce").fillna(0)
-                if col_dim == "（なし）":
-                    result = (
-                        df_pivot_base.groupby(row_dim, dropna=False)["取扱高合計"]
-                        .sum()
-                        .reset_index()
-                        .sort_values(by=row_dim)
-                    )
-                    if show_percent:
-                        total = result["取扱高合計"].sum()
-                        result["構成比(%)"] = (result["取扱高合計"] / total * 100).round(2) if total else 0.0
-                    st.dataframe(result, use_container_width=True)
-                    csv_bytes = result.to_csv(index=False).encode("utf-8-sig")
-                else:
-                    pv = pd.pivot_table(
-                        df_pivot_base,
-                        index=[row_dim],
-                        columns=[col_dim],
-                        values="取扱高合計",
-                        aggfunc="sum",
-                        fill_value=0,
-                        dropna=False,
-                        sort=True
-                    )
-                    if show_percent:
-                        row_sum = pv.sum(axis=1).replace(0, pd.NA)
-                        pv_percent = (pv.div(row_sum, axis=0) * 100).round(2).fillna(0)
-                        st.write("行方向の構成比（%）")
-                        st.dataframe(pv_percent, use_container_width=True)
-                        csv_bytes = pv_percent.reset_index().to_csv(index=False).encode("utf-8-sig")
-                    else:
-                        st.dataframe(pv, use_container_width=True)
-                        csv_bytes = pv.reset_index().to_csv(index=False).encode("utf-8-sig")
+filtered_df = add_group_columns(filtered_df)
 
-            st.download_button("クロス集計CSVをダウンロード", csv_bytes, "pivot.csv", "text/csv")
+st.metric("件数", f"{len(filtered_df):,}件")
 
-        except Exception as e:
-            with st.expander("🔎 デバッグ情報（開いて確認）"):
-                st.write("エラー:", str(e))
-                st.write("列一覧:", df_pivot_base.columns.tolist())
-                dup_counts = pd.Series(df_pivot_base.columns).value_counts()
-                st.write("重複列名（出現回数）:", dup_counts[dup_counts > 1] if (dup_counts > 1).any() else "なし")
-                st.write("選択 Row/Column:", row_dim, col_dim)
-            st.error("クロス集計でエラーが発生しました。")
 
+# ----------------------------------------------------
+# データ一覧・CSV
+# ----------------------------------------------------
+st.subheader("📋 フィルタ後データ一覧")
+
+preview_limit = st.number_input(
+    "画面に表示する最大行数",
+    min_value=100,
+    max_value=5000,
+    value=500,
+    step=100,
+    help=(
+        "画面表示だけを制限します。"
+        "ダウンロードCSVにはフィルタ後の全件が含まれます。"
+    ),
+)
+
+display_cols = []
+
+for col in ["媒体コード", "媒体名", "カテゴリ"]:
+    if col in filtered_df.columns:
+        display_cols.append(col)
+
+display_cols.extend(
+    col for col in filtered_df.columns
+    if col not in display_cols
+)
+
+st.dataframe(
+    filtered_df[display_cols].head(int(preview_limit)),
+    width="stretch",
+)
+
+csv_bytes = filtered_df.to_csv(
+    index=False,
+).encode("utf-8-sig")
+
+st.download_button(
+    "フィルタ後データCSVをダウンロード",
+    data=csv_bytes,
+    file_name="filtered_data.csv",
+    mime="text/csv",
+)
+
+
+# ----------------------------------------------------
+# 承認率一覧
+# ----------------------------------------------------
+if "媒体名" in filtered_df.columns:
+    st.subheader("📌 媒体別 承認率一覧（降順）")
+
+    approval_summary = (
+        filtered_df.assign(
+            承認フラグ=filtered_df["承認区分"].eq("承認").astype(int)
+        )
+        .groupby("媒体名", dropna=False)
+        .agg(
+            件数=("承認区分", "size"),
+            承認件数=("承認フラグ", "sum"),
+        )
+        .reset_index()
+    )
+
+    approval_summary["承認率(%)"] = (
+        approval_summary["承認件数"]
+        .div(approval_summary["件数"].replace(0, pd.NA))
+        .mul(100)
+        .fillna(0)
+        .round(2)
+    )
+
+    approval_summary = approval_summary.sort_values(
+        "承認率(%)",
+        ascending=False,
+    )
+
+    st.dataframe(
+        approval_summary,
+        width="stretch",
+    )
+
+    st.download_button(
+        "承認率一覧CSVをダウンロード",
+        data=approval_summary.to_csv(
+            index=False,
+        ).encode("utf-8-sig"),
+        file_name="approval_summary.csv",
+        mime="text/csv",
+    )
+
+
+# ----------------------------------------------------
+# グラフ
+# 一度に全グラフを生成せず、選択した1つだけ描画する
+# ----------------------------------------------------
+st.subheader("📈 項目別インタラクティブグラフ")
+
+available_chart_labels = [
+    label
+    for label, column in CHART_OPTIONS.items()
+    if column in filtered_df.columns
+    and not filtered_df[column].dropna().empty
+]
+
+if available_chart_labels:
+    selected_chart_label = st.selectbox(
+        "表示するグラフ",
+        available_chart_labels,
+    )
+    selected_chart_col = CHART_OPTIONS[selected_chart_label]
+
+    chart = create_dual_axis_chart(
+        filtered_df,
+        selected_chart_col,
+        selected_chart_label,
+    )
+
+    st.plotly_chart(
+        chart,
+        width="stretch",
+    )
 else:
-    # アップロードが未実施の案内
-    st.info("Excelファイル（後方数値データ）をアップロードしてください。")
+    st.info("表示できるグラフ項目がありません。")
 
+
+# ----------------------------------------------------
+# クロス集計
+# 実行ボタンを押したときだけ作る
+# ----------------------------------------------------
+st.subheader("🧮 クロス集計（ピボット）")
+
+pivot_base = filtered_df.loc[
+    :,
+    ~pd.Index(filtered_df.columns).duplicated(),
+].copy()
+
+available_pivot_cols = [
+    col for col in PIVOT_CANDIDATES
+    if col in pivot_base.columns
+]
+
+if not available_pivot_cols:
+    st.info("ピボット可能な項目がありません。")
+else:
+    row_dim = st.selectbox(
+        "行（Row）",
+        available_pivot_cols,
+    )
+
+    col_dim = st.selectbox(
+        "列（Column）",
+        ["（なし）", *available_pivot_cols],
+    )
+
+    value_metric = st.selectbox(
+        "値（Value）",
+        ["件数", "取扱高合計"],
+    )
+
+    show_percent = st.checkbox(
+        "行方向の構成比（%）を表示",
+        value=False,
+    )
+
+    if st.button("クロス集計を作成"):
+        pivot_base[row_dim] = to_1d_str(pivot_base[row_dim])
+
+        if col_dim != "（なし）":
+            pivot_base[col_dim] = to_1d_str(pivot_base[col_dim])
+
+        if value_metric == "件数":
+            if col_dim == "（なし）":
+                result = (
+                    pivot_base
+                    .groupby(row_dim, dropna=False)
+                    .size()
+                    .reset_index(name="件数")
+                )
+
+                if show_percent:
+                    total = result["件数"].sum()
+                    result["構成比(%)"] = (
+                        result["件数"] / total * 100
+                    ).round(2) if total else 0.0
+
+            else:
+                result = pd.crosstab(
+                    pivot_base[row_dim],
+                    pivot_base[col_dim],
+                    dropna=False,
+                )
+
+                if show_percent:
+                    row_total = result.sum(axis=1).replace(0, pd.NA)
+                    result = (
+                        result.div(row_total, axis=0)
+                        .mul(100)
+                        .round(2)
+                        .fillna(0)
+                    )
+
+        else:
+            pivot_base["取扱高合計"] = pd.to_numeric(
+                pivot_base["取扱高"],
+                errors="coerce",
+            ).fillna(0)
+
+            if col_dim == "（なし）":
+                result = (
+                    pivot_base
+                    .groupby(row_dim, dropna=False)["取扱高合計"]
+                    .sum()
+                    .reset_index()
+                )
+
+                if show_percent:
+                    total = result["取扱高合計"].sum()
+                    result["構成比(%)"] = (
+                        result["取扱高合計"] / total * 100
+                    ).round(2) if total else 0.0
+
+            else:
+                result = pd.pivot_table(
+                    pivot_base,
+                    index=row_dim,
+                    columns=col_dim,
+                    values="取扱高合計",
+                    aggfunc="sum",
+                    fill_value=0,
+                    dropna=False,
+                )
+
+                if show_percent:
+                    row_total = result.sum(axis=1).replace(0, pd.NA)
+                    result = (
+                        result.div(row_total, axis=0)
+                        .mul(100)
+                        .round(2)
+                        .fillna(0)
+                    )
+
+        st.dataframe(
+            result,
+            width="stretch",
+        )
+
+        download_df = (
+            result.reset_index()
+            if isinstance(result.index, pd.Index)
+            else result
+        )
+
+        st.download_button(
+            "クロス集計CSVをダウンロード",
+            data=download_df.to_csv(
+                index=False,
+            ).encode("utf-8-sig"),
+            file_name="pivot.csv",
+            mime="text/csv",
+        )
