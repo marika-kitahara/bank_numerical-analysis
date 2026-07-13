@@ -44,14 +44,26 @@ if uploaded_master is not None:
     master.rename(columns={"会社名": "媒体名"}, inplace=True)
 
     id_vars = [col for col in master.columns if col in ["媒体名", "カテゴリ"]]
-    code_cols = [col for col in master.columns if col not in id_vars]
 
-    master_long = master.melt(
-        id_vars=id_vars,
-        value_vars=code_cols,
-        var_name="コード列",
-        value_name="媒体コード"
-    ).dropna(subset=["媒体コード"])
+    # すでに「媒体コード」列がある形式なら、そのまま使う
+    if "媒体コード" in master.columns:
+        master_long = master[
+            [col for col in ["媒体名", "カテゴリ", "媒体コード"]
+             if col in master.columns]
+        ].copy()
+
+        master_long = master_long.dropna(subset=["媒体コード"])
+
+    # 横持ち形式ならmeltする
+    else:
+        code_cols = [col for col in master.columns if col not in id_vars]
+
+        master_long = master.melt(
+            id_vars=id_vars,
+            value_vars=code_cols,
+            var_name="コード列",
+            value_name="媒体コード"
+        ).dropna(subset=["媒体コード"])
 
 else:
     st.warning("媒体コードマスタをアップロードしてください。")
