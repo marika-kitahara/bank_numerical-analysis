@@ -702,20 +702,39 @@ with tab_mail:
                         hide_index=True,
                     )
 
-                    st.subheader("小項目ごとの比較")
-                    for small in selected_smalls:
-                        small_target = target[target["小項目"].astype(str).str.strip() == small]
-                        if small_target.empty:
+                    st.subheader("小項目・キャンペーン比較グラフ")
+                    st.caption(
+                        "横軸を小項目、系列をキャンペーンとして、選択した小項目を同じグラフ内で比較します。"
+                    )
+
+                    # 小項目を横軸、キャンペーンを系列にした集合縦棒グラフ。
+                    # Streamlitのbar_chartでは、DataFrameの各列が系列として横並び表示される。
+                    chart_source = aggregate(target, ["小項目", campaign_col])
+
+                    chart_left, chart_right = st.columns(2)
+                    for chart_area, metric, chart_key in [
+                        (chart_left, metric1, "mail_chart_1"),
+                        (chart_right, metric2, "mail_chart_2"),
+                    ]:
+                        chart_area.markdown(f"#### {metric}")
+                        if metric not in chart_source.columns:
+                            chart_area.info(f"{metric}を集計できません。")
                             continue
-                        small_res = aggregate(small_target, [campaign_col])
-                        with st.expander(f"小項目：{small}", expanded=True):
-                            cols = [campaign_col] + [m for m in mail_metrics if m in small_res.columns]
-                            st.dataframe(format_table(small_res[cols]), use_container_width=True, hide_index=True)
-                            chart1, chart2 = st.columns(2)
-                            chart1.caption(metric1)
-                            chart1.bar_chart(small_res.set_index(campaign_col)[[metric1]])
-                            chart2.caption(metric2)
-                            chart2.bar_chart(small_res.set_index(campaign_col)[[metric2]])
+
+                        metric_pivot = chart_source.pivot_table(
+                            index="小項目",
+                            columns=campaign_col,
+                            values=metric,
+                            aggfunc="sum",
+                        )
+                        metric_pivot = metric_pivot.reindex(selected_smalls)
+
+                        # 選択順を維持し、全欠損の系列だけ除外する。
+                        metric_pivot = metric_pivot.dropna(axis=1, how="all")
+                        if metric_pivot.empty or len(metric_pivot.columns) == 0:
+                            chart_area.info("表示できるデータがありません。")
+                        else:
+                            chart_area.bar_chart(metric_pivot, use_container_width=True)
 
                     st.download_button(
                         "📥 メルマガ分析をダウンロード",
