@@ -458,7 +458,7 @@ def allocation_simulator(df: pd.DataFrame):
             a = projected[metric]
             rows.append({"指標": metric, "移管前": b, "移管後試算": a, "差分": a - b, "変化率": safe_div(a - b, b)})
         impact = pd.DataFrame(rows)
-        st.dataframe(format_table(impact), use_container_width=True, hide_index=True)
+        st.dataframe(format_table(impact), width="stretch", hide_index=True)
         if effective_amount < amount:
             st.warning(f"元媒体の実績コストを超えるため、試算上は {effective_amount:,.0f}円で計算しました。")
 
@@ -548,7 +548,7 @@ with tab_media:
         st.info("集計軸または表示項目を1つ以上選択してください。")
     else:
         media_output = res[display_cols]
-        st.dataframe(format_table(media_output), use_container_width=True, hide_index=True)
+        st.dataframe(format_table(media_output), width="stretch", hide_index=True)
         st.download_button("📥 媒体分析をダウンロード", to_excel(media_output), "媒体分析.xlsx")
 
     if "申込日" in df.columns and groups:
@@ -574,7 +574,7 @@ with tab_win:
         win = win[win["申込件数"] >= min_count]
         ascending = target_metric in {"申込CPA", "承認CPA"}
         win = win.sort_values(target_metric, ascending=ascending, na_position="last")
-        st.dataframe(format_table(win.head(30)), use_container_width=True, hide_index=True)
+        st.dataframe(format_table(win.head(30)), width="stretch", hide_index=True)
         if not win.empty:
             top = win.iloc[0]
             combo = " × ".join(str(top[c]) for c in pattern_cols)
@@ -590,7 +590,7 @@ with tab_cross:
     metric = st.selectbox("指標", [m for m in CORE_METRICS if m in all_metrics], key="cross_metric")
     if x != y:
         cross = aggregate(df, [x, y])
-        st.dataframe(format_table(cross), use_container_width=True, hide_index=True)
+        st.dataframe(format_table(cross), width="stretch", hide_index=True)
         pivot = cross.pivot_table(index=x, columns=y, values=metric, aggfunc="sum")
 
         st.subheader("クロス集計表")
@@ -601,14 +601,14 @@ with tab_cross:
             pivot_display = pivot.map(lambda v: f"{v:.2f}" if pd.notna(v) else "-")
         else:
             pivot_display = pivot.map(lambda v: f"{v:,.0f}" if pd.notna(v) else "-")
-        st.dataframe(pivot_display, use_container_width=True)
+        st.dataframe(pivot_display, width="stretch")
 
         st.subheader("上位組み合わせ")
         sort_ascending = metric in {"申込CPA", "承認CPA"}
         top_n = st.slider("表示件数", min_value=5, max_value=50, value=15, step=5, key="cross_top_n")
         ranking_cols = [x, y, metric]
         ranking = cross[ranking_cols].sort_values(metric, ascending=sort_ascending, na_position="last").head(top_n)
-        st.dataframe(format_table(ranking), use_container_width=True, hide_index=True)
+        st.dataframe(format_table(ranking), width="stretch", hide_index=True)
 
         st.download_button("📥 クロス分析をダウンロード", to_excel(cross), "クロス分析.xlsx")
 
@@ -622,7 +622,7 @@ with tab_seg:
     edited = st.data_editor(
         toggle,
         hide_index=True,
-        use_container_width=True,
+        width="stretch",
         disabled=[seg],
         column_config={"表示": st.column_config.CheckboxColumn("グラフ表示")},
         key="seg_toggle",
@@ -630,7 +630,7 @@ with tab_seg:
     selected_values = edited.loc[edited["表示"], seg].tolist()
     chart_df = seg_res[seg_res[seg].isin(selected_values)].set_index(seg)[[chart_metric]]
     st.bar_chart(chart_df)
-    st.dataframe(format_table(seg_res), use_container_width=True, hide_index=True)
+    st.dataframe(format_table(seg_res), width="stretch", hide_index=True)
     st.download_button("📥 セグメント分析をダウンロード", to_excel(seg_res), "セグメント分析.xlsx")
 
 with tab_mail:
@@ -698,7 +698,7 @@ with tab_mail:
                     st.subheader("小項目別一覧")
                     st.dataframe(
                         format_table(all_mail_res[display_mail_cols]),
-                        use_container_width=True,
+                        width="stretch",
                         hide_index=True,
                     )
 
@@ -734,7 +734,7 @@ with tab_mail:
                         if metric_pivot.empty or len(metric_pivot.columns) == 0:
                             chart_area.info("表示できるデータがありません。")
                         else:
-                            chart_area.bar_chart(metric_pivot, use_container_width=True)
+                            chart_area.bar_chart(metric_pivot, width="stretch")
 
                     st.download_button(
                         "📥 メルマガ分析をダウンロード",
