@@ -677,30 +677,71 @@ with tab_mail:
                         if selected_campaigns else target_small_df
                     )
 
+                    # 先に集計結果を作り、実際に生成できた指標だけをUI候補にする。
+                    # 表示項目を変更した際、存在しない列や古いsession_state値が残って
+                    # DataFrame列選択で落ちる問題を防ぐ。
+                    all_mail_res = aggregate(target, ["小項目", campaign_col])
+                    available_mail_metrics = [m for m in CORE_METRICS if m in all_mail_res.columns]
+
+                    if not available_mail_metrics:
+                        st.info("集計可能な表示項目がありません。")
+                        st.stop()
+
+                    # デプロイ更新前の選択値がsession_stateに残っている場合も安全に補正する。
+                    saved_mail_metrics = st.session_state.get("mail_metrics", ["申込件数"])
+                    if not isinstance(saved_mail_metrics, list):
+                        saved_mail_metrics = [saved_mail_metrics]
+                    saved_mail_metrics = [m for m in saved_mail_metrics if m in available_mail_metrics]
+                    if not saved_mail_metrics:
+                        saved_mail_metrics = ["申込件数"] if "申込件数" in available_mail_metrics else [available_mail_metrics[0]]
+                    st.session_state["mail_metrics"] = saved_mail_metrics
+
                     mail_metrics = st.multiselect(
                         "表示項目",
-                        CORE_METRICS,
-                        default=CORE_METRICS,
+                        available_mail_metrics,
+                        default=["申込件数"] if "申込件数" in available_mail_metrics else [available_mail_metrics[0]],
                         key="mail_metrics",
                     )
+
+                    # グラフ側の古い選択値も、現在利用可能な候補へ補正する。
+                    if st.session_state.get("mail_metric1") not in available_mail_metrics:
+                        st.session_state["mail_metric1"] = "申込件数" if "申込件数" in available_mail_metrics else available_mail_metrics[0]
+                    default_metric2 = "承認率" if "承認率" in available_mail_metrics else available_mail_metrics[min(1, len(available_mail_metrics) - 1)]
+                    if st.session_state.get("mail_metric2") not in available_mail_metrics:
+                        st.session_state["mail_metric2"] = default_metric2
+
                     g1, g2 = st.columns(2)
-                    metric1 = g1.selectbox("比較グラフ1の指標", CORE_METRICS, index=0, key="mail_metric1")
+                    metric1 = g1.selectbox(
+                        "比較グラフ1の指標",
+                        available_mail_metrics,
+                        index=available_mail_metrics.index("申込件数") if "申込件数" in available_mail_metrics else 0,
+                        key="mail_metric1",
+                    )
                     metric2 = g2.selectbox(
                         "比較グラフ2の指標",
-                        CORE_METRICS,
-                        index=CORE_METRICS.index("承認率"),
+                        available_mail_metrics,
+                        index=available_mail_metrics.index(default_metric2),
                         key="mail_metric2",
                     )
 
-                    # 全選択小項目をまとめた一覧。小項目ごとの行として確認・出力できる。
-                    all_mail_res = aggregate(target, ["小項目", campaign_col])
-                    display_mail_cols = ["小項目", campaign_col] + [m for m in mail_metrics if m in all_mail_res.columns]
+                    # 小項目・キャンペーン列は常に残し、表示指標が未選択でも落とさない。
+                    display_mail_cols = list(dict.fromkeys(
+                        ["小項目", campaign_col] + [m for m in mail_metrics if m in all_mail_res.columns]
+                    ))
                     st.subheader("小項目別一覧")
-                    st.dataframe(
-                        format_table(all_mail_res[display_mail_cols]),
-                        width="stretch",
-                        hide_index=True,
-                    )
+                    if mail_metrics:
+                        st.dataframe(
+                            format_table(all_mail_res.loc[:, display_mail_cols]),
+                            width="stretch",
+                            hide_index=True,
+                        )
+                    else:
+                        st.info("表示項目を1つ以上選択してください。")
+                        st.dataframe(
+                            all_mail_res.loc[:, list(dict.fromkeys(["小項目", campaign_col]))],
+                            width="stretch",
+                            hide_index=True,
+                        )
 
                     st.subheader("小項目・キャンペーン比較グラフ")
                     st.caption(
