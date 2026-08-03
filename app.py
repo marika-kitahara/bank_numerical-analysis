@@ -49,8 +49,8 @@ st.markdown(
 # ======================
 # ブラウザ別設定保存
 # ======================
-PREFERENCE_STORAGE_KEY = "rear_numeric_analysis_preferences_v2"
-PREFERENCE_SCHEMA_VERSION = 2
+PREFERENCE_STORAGE_KEY = "rear_numeric_analysis_preferences_v3"
+PREFERENCE_SCHEMA_VERSION = 3
 PREFERENCE_KEYS = [
     "data_sheet", "master_sheet", "use_cost_sheet", "cost_sheet",
     "filter_date_range", "filter_big", "filter_middle", "filter_small",
@@ -62,6 +62,29 @@ PREFERENCE_KEYS = [
     "mail_smalls", "mail_campaigns", "mail_metrics", "mail_metric1", "mail_metric2",
     "mail_segment_col", "mail_segment_metric",
 ]
+
+
+# 管理者デフォルト。ブラウザ保存値がない初回表示・設定初期化後はこの値を使う。
+ADMIN_DEFAULTS = {
+    "media_groups": ["大項目", "中項目", "小項目"],
+    "media_trend_group": "中項目",
+    "win_selected_middle": "すべて",
+    "win_pattern_cols": ["小項目", "利用目的", "年齢グループ"],
+    "win_target_metric": "承認率",
+    "win_min_count": 30,
+    "alloc_amount": 500000.0,
+    "cross_x": "年齢グループ",
+    "cross_y": "利用目的",
+    "seg_col": "小項目",
+    "mail_metrics": ["申込件数"],
+    "mail_metric1": "申込件数",
+    "mail_metric2": "承認率",
+}
+
+
+def admin_default(key, fallback=None):
+    value = ADMIN_DEFAULTS.get(key, fallback)
+    return list(value) if isinstance(value, list) else value
 
 
 def serializable_value(value):
@@ -557,7 +580,7 @@ def allocation_simulator(df: pd.DataFrame):
 
     consume_saved_preference("alloc_from_middle", middles, default=middles[0])
     consume_saved_preference("alloc_to_middle", middles, default=middles[1] if len(middles) > 1 else middles[0])
-    consume_saved_preference("alloc_amount", default=500000.0)
+    consume_saved_preference("alloc_amount", default=admin_default("alloc_amount", 500000.0))
 
     # 依存する選択肢が変わった際、古いsession_state値が残って選択不能になるのを防ぐ。
     if st.session_state.get("alloc_from_middle") not in middles:
@@ -722,8 +745,8 @@ tab_media, tab_win, tab_cross, tab_seg, tab_mail = st.tabs([
 with tab_media:
     st.subheader("媒体分析")
     default_groups = [c for c in ["大項目", "中項目", "小項目", "キャンペーン識別"] if c in dimension_cols]
-    consume_saved_preference("media_groups", dimension_cols, default=default_groups[:3], multiple=True)
-    groups = st.multiselect("集計軸", dimension_cols, default=default_groups[:3], key="media_groups")
+    consume_saved_preference("media_groups", dimension_cols, default=[c for c in admin_default("media_groups", default_groups[:3]) if c in dimension_cols], multiple=True)
+    groups = st.multiselect("集計軸", dimension_cols, default=[c for c in admin_default("media_groups", default_groups[:3]) if c in dimension_cols], key="media_groups")
     default_metrics = [m for m in CORE_METRICS if m in all_metrics]
     metric_actions = st.columns([1, 1, 6])
     if metric_actions[0].button("全選択", key="media_select_all"):
@@ -745,7 +768,7 @@ with tab_media:
         st.download_button("📥 媒体分析をダウンロード", to_excel(media_output), "媒体分析.xlsx")
 
     if "申込日" in df.columns and groups:
-        default_trend_group = "中項目" if "中項目" in groups else groups[0]
+        default_trend_group = admin_default("media_trend_group", "中項目") if admin_default("media_trend_group", "中項目") in groups else groups[0]
         trend_metric_options = [m for m in selected_metrics if m in CORE_METRICS] or ["申込件数"]
         consume_saved_preference("media_trend_group", groups, default=default_trend_group)
         consume_saved_preference("media_trend_metric", trend_metric_options, default=trend_metric_options[0])
@@ -761,18 +784,18 @@ with tab_win:
     middle_options = sorted(df["中項目"].dropna().astype(str).str.strip().unique()) if "中項目" in df.columns else []
     middle_options = [v for v in middle_options if v and v.casefold() != "nan"]
     win_middle_options = ["すべて"] + middle_options
-    consume_saved_preference("win_selected_middle", win_middle_options, default="すべて")
+    consume_saved_preference("win_selected_middle", win_middle_options, default=admin_default("win_selected_middle", "すべて"))
     selected_middle = st.selectbox("分析する中項目", win_middle_options, key="win_selected_middle")
     win_df = df if selected_middle == "すべて" else df[df["中項目"].astype(str).str.strip() == selected_middle]
     pattern_options = [c for c in ["小項目", "媒体名", "キャンペーン識別", "年齢グループ", "年収グループ", "性別", "利用目的", "都道府県"] if c in dimension_cols]
-    pattern_defaults = [c for c in ["小項目", "利用目的", "年齢グループ"] if c in pattern_options]
+    pattern_defaults = [c for c in admin_default("win_pattern_cols", ["小項目", "利用目的", "年齢グループ"]) if c in pattern_options]
     consume_saved_preference("win_pattern_cols", pattern_options, default=pattern_defaults, multiple=True)
     pattern_cols = st.multiselect("勝ちパターンの組み合わせ", pattern_options, default=pattern_defaults, key="win_pattern_cols")
     win_metric_options = ["承認率", "申込件数", "投下倍率", "取扱金額_翌月", "申込CPA", "承認CPA", "成約件数", "成約率"]
-    consume_saved_preference("win_target_metric", win_metric_options, default="承認率")
-    consume_saved_preference("win_min_count", default=30)
+    consume_saved_preference("win_target_metric", win_metric_options, default=admin_default("win_target_metric", "承認率"))
+    consume_saved_preference("win_min_count", default=admin_default("win_min_count", 30))
     target_metric = st.selectbox("最大化する指標", win_metric_options, key="win_target_metric")
-    min_count = st.number_input("最低申込件数", min_value=1, value=30, step=10, key="win_min_count")
+    min_count = st.number_input("最低申込件数", min_value=1, value=int(admin_default("win_min_count", 30)), step=10, key="win_min_count")
     if pattern_cols:
         win = aggregate(win_df, pattern_cols)
         win = win[win["申込件数"] >= min_count]
@@ -789,8 +812,8 @@ with tab_win:
 
 with tab_cross:
     st.subheader("クロス分析")
-    default_cross_x = "年齢グループ" if "年齢グループ" in dimension_cols else dimension_cols[0]
-    default_cross_y = "利用目的" if "利用目的" in dimension_cols else dimension_cols[min(1, len(dimension_cols)-1)]
+    default_cross_x = admin_default("cross_x", "年齢グループ") if admin_default("cross_x", "年齢グループ") in dimension_cols else dimension_cols[0]
+    default_cross_y = admin_default("cross_y", "利用目的") if admin_default("cross_y", "利用目的") in dimension_cols else dimension_cols[min(1, len(dimension_cols)-1)]
     cross_metric_options = [m for m in CORE_METRICS if m in all_metrics]
     consume_saved_preference("cross_x", dimension_cols, default=default_cross_x)
     consume_saved_preference("cross_y", dimension_cols, default=default_cross_y)
@@ -825,7 +848,7 @@ with tab_cross:
 
 with tab_seg:
     st.subheader("セグメント別分析")
-    default_seg = "小項目" if "小項目" in dimension_cols else dimension_cols[0]
+    default_seg = admin_default("seg_col", "小項目") if admin_default("seg_col", "小項目") in dimension_cols else dimension_cols[0]
     seg_metric_options = [m for m in CORE_METRICS if m in all_metrics]
     consume_saved_preference("seg_col", dimension_cols, default=default_seg)
     consume_saved_preference("seg_metric", seg_metric_options, default=seg_metric_options[0])
@@ -933,9 +956,9 @@ with tab_mail:
                                 st.info("集計可能な表示項目がありません。")
                             else:
                                 # 一覧表のデフォルト表示は申込件数。
-                                consume_saved_preference("mail_metrics", available_mail_metrics, default=["申込件数"], multiple=True)
-                                consume_saved_preference("mail_metric1", available_mail_metrics, default="申込件数" if "申込件数" in available_mail_metrics else available_mail_metrics[0])
-                                consume_saved_preference("mail_metric2", available_mail_metrics, default="承認率" if "承認率" in available_mail_metrics else available_mail_metrics[0])
+                                consume_saved_preference("mail_metrics", available_mail_metrics, default=[m for m in admin_default("mail_metrics", ["申込件数"]) if m in available_mail_metrics], multiple=True)
+                                consume_saved_preference("mail_metric1", available_mail_metrics, default=admin_default("mail_metric1", "申込件数") if admin_default("mail_metric1", "申込件数") in available_mail_metrics else available_mail_metrics[0])
+                                consume_saved_preference("mail_metric2", available_mail_metrics, default=admin_default("mail_metric2", "承認率") if admin_default("mail_metric2", "承認率") in available_mail_metrics else available_mail_metrics[0])
                                 saved_mail_metrics = st.session_state.get("mail_metrics", ["申込件数"])
                                 if not isinstance(saved_mail_metrics, list):
                                     saved_mail_metrics = [saved_mail_metrics]
