@@ -1,4 +1,6 @@
+import json
 import re
+import time
 from io import BytesIO
 
 import numpy as np
@@ -6,8 +8,14 @@ import altair as alt
 import pandas as pd
 import streamlit as st
 
+try:
+    from streamlit_local_storage import LocalStorage
+except ImportError:
+    LocalStorage = None
+
 st.set_page_config(page_title="後方数値データ分析", layout="wide")
 st.title("📊 後方数値データ分析ダッシュボード")
+
 
 st.markdown(
     """
@@ -35,6 +43,104 @@ st.markdown(
     """,
     unsafe_allow_html=True,
 )
+
+
+
+# ======================
+# ブラウザ別設定保存
+# ======================
+PREFERENCE_STORAGE_KEY = "rear_numeric_analysis_preferences_v1"
+PREFERENCE_KEYS = [
+    "data_sheet", "master_sheet", "use_cost_sheet", "cost_sheet",
+    "filter_date_range", "filter_big", "filter_middle", "filter_small",
+    "media_groups", "media_metrics", "media_trend_group", "media_trend_metric",
+    "win_selected_middle", "win_pattern_cols", "win_target_metric", "win_min_count",
+    "alloc_from_middle", "alloc_from_small", "alloc_to_middle", "alloc_to_small", "alloc_amount",
+    "cross_x", "cross_y", "cross_metric", "cross_top_n",
+    "seg_col", "seg_metric",
+    "mail_smalls", "mail_campaigns", "mail_metrics", "mail_metric1", "mail_metric2",
+    "mail_segment_col", "mail_segment_metric",
+]
+
+
+def serializable_value(value):
+    """session_stateの値をlocalStorageへ保存できる形へ変換する。"""
+    if isinstance(value, (pd.Timestamp, np.datetime64)):
+        return pd.Timestamp(value).isoformat()
+    if hasattr(value, "isoformat") and not isinstance(value, str):
+        try:
+            return value.isoformat()
+        except Exception:
+            pass
+    if isinstance(value, tuple):
+        return [serializable_value(v) for v in value]
+    if isinstance(value, list):
+        return [serializable_value(v) for v in value]
+    if isinstance(value, np.generic):
+        return value.item()
+    return value
+
+
+def consume_saved_preference(key, options=None, default=None, multiple=False, converter=None):
+    """保存値を各ウィジェット生成前に一度だけ適用し、候補外の値は除外する。"""
+    pending = st.session_state.get("_pending_browser_preferences", {})
+    if key not in pending:
+        return
+
+    value = pending.pop(key)
+    st.session_state["_pending_browser_preferences"] = pending
+
+    if converter is not None:
+        try:
+            value = converter(value)
+        except Exception:
+            value = default
+
+    if options is not None:
+        valid = list(options)
+        if multiple:
+            values = value if isinstance(value, list) else [value]
+            value = [v for v in values if v in valid]
+            if not value and default is not None:
+                value = list(default) if isinstance(default, (list, tuple)) else [default]
+        else:
+            if value not in valid:
+                value = default if default in valid else (valid[0] if valid else None)
+
+    if value is not None:
+        st.session_state[key] = value
+
+
+def load_browser_preferences(storage):
+    """localStorageから保存設定を読み込み、段階的適用用の待機領域へ入れる。"""
+    if storage is None:
+        return
+    raw = storage.getItem(PREFERENCE_STORAGE_KEY, key="browser_preferences_raw")
+    if st.session_state.get("_browser_preferences_loaded"):
+        return
+    if raw in (None, "", {}):
+        return
+    try:
+        data = json.loads(raw) if isinstance(raw, str) else raw
+        if isinstance(data, dict):
+            st.session_state["_pending_browser_preferences"] = data
+            st.session_state["_browser_preferences_loaded"] = True
+            st.rerun()
+    except Exception:
+        st.session_state["_browser_preferences_loaded"] = True
+
+
+def collect_preferences():
+    result = {}
+    for key in PREFERENCE_KEYS:
+        if key in st.session_state:
+            result[key] = serializable_value(st.session_state[key])
+    return result
+
+
+local_storage = LocalStorage() if LocalStorage is not None else None
+load_browser_preferences(local_storage)
+
 
 CORE_METRICS = [
     "申込件数", "承認件数", "成約件数", "承認率", "成約率",
@@ -314,6 +420,7 @@ def selection_filter(df: pd.DataFrame, column: str, label: str, key: str) -> pd.
         st.sidebar.caption(f"{label}: 現在選択可能な値なし")
         return df
 
+    consume_saved_preference(key, choices, default=[], multiple=True)
     selected = st.sidebar.multiselect(
         label,
         choices,
@@ -382,6 +489,10 @@ def allocation_simulator(df: pd.DataFrame):
         st.info("現在のフィルタ条件では、選択可能な中項目がありません。")
         return
 
+    consume_saved_preference("alloc_from_middle", middles, default=middles[0])
+    consume_saved_preference("alloc_to_middle", middles, default=middles[1] if len(middles) > 1 else middles[0])
+    consume_saved_preference("alloc_amount", default=500000.0)
+
     # 依存する選択肢が変わった際、古いsession_state値が残って選択不能になるのを防ぐ。
     if st.session_state.get("alloc_from_middle") not in middles:
         st.session_state["alloc_from_middle"] = middles[0]
@@ -394,6 +505,7 @@ def allocation_simulator(df: pd.DataFrame):
     if not from_smalls:
         c2.warning("元媒体の小項目がありません。")
         return
+    consume_saved_preference("alloc_from_small", from_smalls, default=from_smalls[0])
     if st.session_state.get("alloc_from_small") not in from_smalls:
         st.session_state["alloc_from_small"] = from_smalls[0]
     from_small = c2.selectbox("アロケーション元：小項目", from_smalls, key="alloc_from_small")
@@ -409,6 +521,7 @@ def allocation_simulator(df: pd.DataFrame):
         d2.warning("移管先の小項目がありません。")
         return
     preferred_to = next((v for v in to_smalls if not (to_middle == from_middle and v == from_small)), to_smalls[0])
+    consume_saved_preference("alloc_to_small", to_smalls, default=preferred_to)
     if st.session_state.get("alloc_to_small") not in to_smalls:
         st.session_state["alloc_to_small"] = preferred_to
     to_small = d2.selectbox("アロケーション先：小項目", to_smalls, key="alloc_to_small")
@@ -478,10 +591,14 @@ def_index = next((i for i, s in enumerate(sheets) if "後方" in s), 0)
 master_index = next((i for i, s in enumerate(sheets) if "媒体コード" in s or "マスタ" in s), min(1, len(sheets)-1))
 cost_index = next((i for i, s in enumerate(sheets) if "コスト" in s), 0)
 
-data_sheet = st.sidebar.selectbox("後方数値データのシート", sheets, index=def_index)
-master_sheet = st.sidebar.selectbox("媒体コードマスタのシート", sheets, index=master_index)
-use_cost_sheet = st.sidebar.checkbox("コストデータシートでエラーを補完", value=True)
-cost_sheet = st.sidebar.selectbox("コストデータのシート", sheets, index=cost_index, disabled=not use_cost_sheet)
+consume_saved_preference("data_sheet", sheets, default=sheets[def_index])
+consume_saved_preference("master_sheet", sheets, default=sheets[master_index])
+consume_saved_preference("use_cost_sheet", default=True)
+consume_saved_preference("cost_sheet", sheets, default=sheets[cost_index])
+data_sheet = st.sidebar.selectbox("後方数値データのシート", sheets, index=def_index, key="data_sheet")
+master_sheet = st.sidebar.selectbox("媒体コードマスタのシート", sheets, index=master_index, key="master_sheet")
+use_cost_sheet = st.sidebar.checkbox("コストデータシートでエラーを補完", value=True, key="use_cost_sheet")
+cost_sheet = st.sidebar.selectbox("コストデータのシート", sheets, index=cost_index, disabled=not use_cost_sheet, key="cost_sheet")
 
 try:
     raw_df = read_sheet(file_bytes, data_sheet)
@@ -496,7 +613,14 @@ st.sidebar.header("🔍 全タブ共通フィルタ")
 df = base_df.copy()
 valid_dates = df["申込日"].dropna()
 if not valid_dates.empty:
-    date_range = st.sidebar.date_input("申込日（期間）", [valid_dates.min().date(), valid_dates.max().date()])
+    default_date_range = [valid_dates.min().date(), valid_dates.max().date()]
+    def _date_converter(value):
+        values = value if isinstance(value, list) else [value]
+        return [pd.to_datetime(v).date() for v in values]
+    consume_saved_preference("filter_date_range", default=default_date_range, converter=_date_converter)
+    date_range = st.sidebar.date_input(
+        "申込日（期間）", default_date_range, key="filter_date_range"
+    )
     if len(date_range) == 2:
         df = df[(df["申込日"] >= pd.Timestamp(date_range[0])) & (df["申込日"] < pd.Timestamp(date_range[1]) + pd.Timedelta(days=1))]
 
@@ -532,6 +656,7 @@ tab_media, tab_win, tab_cross, tab_seg, tab_mail = st.tabs([
 with tab_media:
     st.subheader("媒体分析")
     default_groups = [c for c in ["大項目", "中項目", "小項目", "キャンペーン識別"] if c in dimension_cols]
+    consume_saved_preference("media_groups", dimension_cols, default=default_groups[:3], multiple=True)
     groups = st.multiselect("集計軸", dimension_cols, default=default_groups[:3], key="media_groups")
     default_metrics = [m for m in CORE_METRICS if m in all_metrics]
     metric_actions = st.columns([1, 1, 6])
@@ -541,6 +666,7 @@ with tab_media:
     if metric_actions[1].button("基本項目", key="media_select_core"):
         st.session_state["media_metrics"] = default_metrics
         st.rerun()
+    consume_saved_preference("media_metrics", all_metrics, default=default_metrics, multiple=True)
     selected_metrics = st.multiselect("表示項目", all_metrics, default=default_metrics, key="media_metrics")
     res = aggregate(df, groups)
     res = add_extra_numeric_sums(df, res, groups, selected_metrics)
@@ -553,8 +679,12 @@ with tab_media:
         st.download_button("📥 媒体分析をダウンロード", to_excel(media_output), "媒体分析.xlsx")
 
     if "申込日" in df.columns and groups:
-        trend_group = st.selectbox("日次推移の系列", groups, index=groups.index("中項目") if "中項目" in groups else 0, key="media_trend_group")
-        trend_metric = st.selectbox("日次推移の指標", [m for m in selected_metrics if m in CORE_METRICS] or ["申込件数"], key="media_trend_metric")
+        default_trend_group = "中項目" if "中項目" in groups else groups[0]
+        trend_metric_options = [m for m in selected_metrics if m in CORE_METRICS] or ["申込件数"]
+        consume_saved_preference("media_trend_group", groups, default=default_trend_group)
+        consume_saved_preference("media_trend_metric", trend_metric_options, default=trend_metric_options[0])
+        trend_group = st.selectbox("日次推移の系列", groups, key="media_trend_group")
+        trend_metric = st.selectbox("日次推移の指標", trend_metric_options, key="media_trend_metric")
         daily_df = df.copy(); daily_df["日付"] = daily_df["申込日"].dt.date
         daily = aggregate(daily_df, ["日付", trend_group])
         pivot = daily.pivot_table(index="日付", columns=trend_group, values=trend_metric, aggfunc="sum")
@@ -564,13 +694,19 @@ with tab_win:
     st.subheader("勝ちパターン分析")
     middle_options = sorted(df["中項目"].dropna().astype(str).str.strip().unique()) if "中項目" in df.columns else []
     middle_options = [v for v in middle_options if v and v.casefold() != "nan"]
-    selected_middle = st.selectbox("分析する中項目", ["すべて"] + middle_options, key="win_selected_middle")
+    win_middle_options = ["すべて"] + middle_options
+    consume_saved_preference("win_selected_middle", win_middle_options, default="すべて")
+    selected_middle = st.selectbox("分析する中項目", win_middle_options, key="win_selected_middle")
     win_df = df if selected_middle == "すべて" else df[df["中項目"].astype(str).str.strip() == selected_middle]
     pattern_options = [c for c in ["小項目", "媒体名", "キャンペーン識別", "年齢グループ", "年収グループ", "性別", "利用目的", "都道府県"] if c in dimension_cols]
     pattern_defaults = [c for c in ["小項目", "利用目的", "年齢グループ"] if c in pattern_options]
+    consume_saved_preference("win_pattern_cols", pattern_options, default=pattern_defaults, multiple=True)
     pattern_cols = st.multiselect("勝ちパターンの組み合わせ", pattern_options, default=pattern_defaults, key="win_pattern_cols")
-    target_metric = st.selectbox("最大化する指標", ["承認率", "申込件数", "投下倍率", "取扱金額_翌月", "申込CPA", "承認CPA", "成約件数", "成約率"])
-    min_count = st.number_input("最低申込件数", min_value=1, value=30, step=10)
+    win_metric_options = ["承認率", "申込件数", "投下倍率", "取扱金額_翌月", "申込CPA", "承認CPA", "成約件数", "成約率"]
+    consume_saved_preference("win_target_metric", win_metric_options, default="承認率")
+    consume_saved_preference("win_min_count", default=30)
+    target_metric = st.selectbox("最大化する指標", win_metric_options, key="win_target_metric")
+    min_count = st.number_input("最低申込件数", min_value=1, value=30, step=10, key="win_min_count")
     if pattern_cols:
         win = aggregate(win_df, pattern_cols)
         win = win[win["申込件数"] >= min_count]
@@ -587,9 +723,16 @@ with tab_win:
 
 with tab_cross:
     st.subheader("クロス分析")
-    x = st.selectbox("X軸", dimension_cols, index=dimension_cols.index("年齢グループ") if "年齢グループ" in dimension_cols else 0, key="cross_x")
-    y = st.selectbox("Y軸", dimension_cols, index=dimension_cols.index("利用目的") if "利用目的" in dimension_cols else min(1, len(dimension_cols)-1), key="cross_y")
-    metric = st.selectbox("指標", [m for m in CORE_METRICS if m in all_metrics], key="cross_metric")
+    default_cross_x = "年齢グループ" if "年齢グループ" in dimension_cols else dimension_cols[0]
+    default_cross_y = "利用目的" if "利用目的" in dimension_cols else dimension_cols[min(1, len(dimension_cols)-1)]
+    cross_metric_options = [m for m in CORE_METRICS if m in all_metrics]
+    consume_saved_preference("cross_x", dimension_cols, default=default_cross_x)
+    consume_saved_preference("cross_y", dimension_cols, default=default_cross_y)
+    consume_saved_preference("cross_metric", cross_metric_options, default=cross_metric_options[0])
+    consume_saved_preference("cross_top_n", default=15)
+    x = st.selectbox("X軸", dimension_cols, key="cross_x")
+    y = st.selectbox("Y軸", dimension_cols, key="cross_y")
+    metric = st.selectbox("指標", cross_metric_options, key="cross_metric")
     if x != y:
         cross = aggregate(df, [x, y])
         st.dataframe(format_table(cross), width="stretch", hide_index=True)
@@ -616,8 +759,12 @@ with tab_cross:
 
 with tab_seg:
     st.subheader("セグメント別分析")
-    seg = st.selectbox("分析項目", dimension_cols, index=dimension_cols.index("小項目") if "小項目" in dimension_cols else 0, key="seg_col")
-    chart_metric = st.selectbox("縦棒グラフの指標", [m for m in CORE_METRICS if m in all_metrics], key="seg_metric")
+    default_seg = "小項目" if "小項目" in dimension_cols else dimension_cols[0]
+    seg_metric_options = [m for m in CORE_METRICS if m in all_metrics]
+    consume_saved_preference("seg_col", dimension_cols, default=default_seg)
+    consume_saved_preference("seg_metric", seg_metric_options, default=seg_metric_options[0])
+    seg = st.selectbox("分析項目", dimension_cols, key="seg_col")
+    chart_metric = st.selectbox("縦棒グラフの指標", seg_metric_options, key="seg_metric")
     seg_res = aggregate(df, [seg])
     toggle = seg_res[[seg]].copy()
     toggle.insert(0, "表示", True)
@@ -655,6 +802,7 @@ with tab_mail:
             )
 
             # 共通フィルタやファイル変更で候補が変わっても、古い選択値を残さない。
+            consume_saved_preference("mail_smalls", small_options, default=small_options[: min(5, len(small_options))], multiple=True)
             saved_smalls = st.session_state.get("mail_smalls", small_options[: min(5, len(small_options))])
             if not isinstance(saved_smalls, list):
                 saved_smalls = [saved_smalls]
@@ -685,6 +833,7 @@ with tab_mail:
                     )
 
                     # 小項目を変更するとキャンペーン候補も変わるため、無効な選択値を先に除外する。
+                    consume_saved_preference("mail_campaigns", campaigns, default=campaigns[: min(10, len(campaigns))], multiple=True)
                     saved_campaigns = st.session_state.get(
                         "mail_campaigns", campaigns[: min(10, len(campaigns))]
                     )
@@ -718,6 +867,9 @@ with tab_mail:
                                 st.info("集計可能な表示項目がありません。")
                             else:
                                 # 一覧表のデフォルト表示は申込件数。
+                                consume_saved_preference("mail_metrics", available_mail_metrics, default=["申込件数"], multiple=True)
+                                consume_saved_preference("mail_metric1", available_mail_metrics, default="申込件数" if "申込件数" in available_mail_metrics else available_mail_metrics[0])
+                                consume_saved_preference("mail_metric2", available_mail_metrics, default="承認率" if "承認率" in available_mail_metrics else available_mail_metrics[0])
                                 saved_mail_metrics = st.session_state.get("mail_metrics", ["申込件数"])
                                 if not isinstance(saved_mail_metrics, list):
                                     saved_mail_metrics = [saved_mail_metrics]
@@ -868,6 +1020,8 @@ with tab_mail:
                                         if "年齢グループ" in mail_segment_options
                                         else mail_segment_options[0]
                                     )
+                                    consume_saved_preference("mail_segment_col", mail_segment_options, default=default_mail_segment)
+                                    consume_saved_preference("mail_segment_metric", available_mail_metrics, default=default_metric1)
                                     if st.session_state.get("mail_segment_col") not in mail_segment_options:
                                         st.session_state["mail_segment_col"] = default_mail_segment
 
@@ -1012,3 +1166,28 @@ with tab_mail:
                                             to_excel(mail_segment_res),
                                             "メルマガ分析_セグメント別.xlsx",
                                         )
+
+# ======================
+# ブラウザ設定の保存・初期化
+# ======================
+st.sidebar.divider()
+st.sidebar.subheader("⚙️ 個人設定")
+if LocalStorage is None:
+    st.sidebar.warning("ブラウザ保存機能を使うには requirements.txt に streamlit-local-storage を追加してください。")
+else:
+    st.sidebar.caption("このブラウザだけに保存されます。IPアドレスが変わっても有効です。")
+    if st.sidebar.button("💾 現在の設定を保存", width="stretch", key="save_browser_preferences"):
+        payload = json.dumps(collect_preferences(), ensure_ascii=False)
+        local_storage.setItem(PREFERENCE_STORAGE_KEY, payload, key="save_preferences_component")
+        time.sleep(0.8)
+        st.sidebar.success("このブラウザに設定を保存しました。")
+
+    if st.sidebar.button("↩️ 保存設定を初期化", width="stretch", key="reset_browser_preferences"):
+        local_storage.setItem(PREFERENCE_STORAGE_KEY, "", key="reset_preferences_component")
+        for pref_key in PREFERENCE_KEYS:
+            st.session_state.pop(pref_key, None)
+        st.session_state.pop("_pending_browser_preferences", None)
+        st.session_state["_browser_preferences_loaded"] = True
+        time.sleep(0.8)
+        st.rerun()
+
