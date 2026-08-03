@@ -843,3 +843,171 @@ with tab_mail:
                                     to_excel(mail_res),
                                     "メルマガ分析_小項目別.xlsx",
                                 )
+
+                                # ======================
+                                # メルマガ × セグメント分析
+                                # ======================
+                                st.divider()
+                                st.subheader("メルマガのセグメント別分析")
+                                st.caption(
+                                    "セグメント別タブと同じ分析項目から1つ選び、現在選択中の小項目・キャンペーンを比較します。"
+                                )
+
+                                mail_segment_options = [
+                                    c for c in dimension_cols
+                                    if c in target.columns
+                                    and c not in {"小項目", campaign_col}
+                                ]
+
+                                if not mail_segment_options:
+                                    st.info("セグメント分析に使用できる項目がありません。")
+                                else:
+                                    default_mail_segment = (
+                                        "年齢グループ"
+                                        if "年齢グループ" in mail_segment_options
+                                        else mail_segment_options[0]
+                                    )
+                                    if st.session_state.get("mail_segment_col") not in mail_segment_options:
+                                        st.session_state["mail_segment_col"] = default_mail_segment
+
+                                    mail_segment_col = st.selectbox(
+                                        "分析項目",
+                                        mail_segment_options,
+                                        key="mail_segment_col",
+                                    )
+
+                                    if st.session_state.get("mail_segment_metric") not in available_mail_metrics:
+                                        st.session_state["mail_segment_metric"] = default_metric1
+
+                                    mail_segment_metric = st.selectbox(
+                                        "セグメント比較グラフの指標",
+                                        available_mail_metrics,
+                                        key="mail_segment_metric",
+                                    )
+
+                                    segment_source = target.copy()
+                                    segment_source = segment_source[
+                                        segment_source[mail_segment_col].notna()
+                                    ].copy()
+                                    segment_source[mail_segment_col] = (
+                                        segment_source[mail_segment_col]
+                                        .astype(str)
+                                        .str.strip()
+                                    )
+                                    segment_source = segment_source[
+                                        segment_source[mail_segment_col].ne("")
+                                        & segment_source[mail_segment_col].str.casefold().ne("nan")
+                                    ]
+
+                                    if segment_source.empty:
+                                        st.info("選択した分析項目に表示可能なデータがありません。")
+                                    else:
+                                        mail_segment_res = aggregate(
+                                            segment_source,
+                                            [mail_segment_col, "小項目", campaign_col],
+                                        )
+
+                                        segment_display_metrics = [
+                                            m for m in mail_metrics
+                                            if m in mail_segment_res.columns
+                                        ]
+                                        if not segment_display_metrics:
+                                            segment_display_metrics = [mail_segment_metric]
+
+                                        segment_display_cols = list(dict.fromkeys(
+                                            [mail_segment_col, "小項目", campaign_col]
+                                            + segment_display_metrics
+                                        ))
+
+                                        st.markdown("#### セグメント別一覧")
+                                        st.dataframe(
+                                            format_table(
+                                                mail_segment_res.loc[:, segment_display_cols]
+                                            ),
+                                            width="stretch",
+                                            hide_index=True,
+                                        )
+
+                                        st.markdown(f"#### {mail_segment_col}別：{mail_segment_metric}")
+                                        segment_chart_df = mail_segment_res[
+                                            [mail_segment_col, "小項目", campaign_col, mail_segment_metric]
+                                        ].dropna(subset=[mail_segment_metric]).copy()
+
+                                        if segment_chart_df.empty:
+                                            st.info("グラフに表示できるデータがありません。")
+                                        else:
+                                            segment_chart_df["比較系列"] = (
+                                                segment_chart_df["小項目"].astype(str)
+                                                + "｜"
+                                                + segment_chart_df[campaign_col].astype(str)
+                                            )
+                                            segment_order = list(dict.fromkeys(
+                                                segment_chart_df[mail_segment_col].astype(str).tolist()
+                                            ))
+                                            series_order = [
+                                                f"{small}｜{campaign}"
+                                                for small in selected_smalls
+                                                for campaign in selected_campaigns
+                                                if f"{small}｜{campaign}"
+                                                in set(segment_chart_df["比較系列"].tolist())
+                                            ]
+
+                                            y_format = (
+                                                ".1%"
+                                                if mail_segment_metric in {"承認率", "成約率"}
+                                                else ",.0f"
+                                            )
+                                            segment_chart = (
+                                                alt.Chart(segment_chart_df)
+                                                .mark_bar()
+                                                .encode(
+                                                    x=alt.X(
+                                                        f"{mail_segment_col}:N",
+                                                        sort=segment_order,
+                                                        title=mail_segment_col,
+                                                        axis=alt.Axis(labelAngle=-30),
+                                                    ),
+                                                    xOffset=alt.XOffset(
+                                                        "比較系列:N",
+                                                        sort=series_order,
+                                                    ),
+                                                    y=alt.Y(
+                                                        f"{mail_segment_metric}:Q",
+                                                        title=mail_segment_metric,
+                                                        axis=alt.Axis(format=y_format),
+                                                        stack=None,
+                                                    ),
+                                                    color=alt.Color(
+                                                        "比較系列:N",
+                                                        sort=series_order,
+                                                        title="小項目｜キャンペーン",
+                                                    ),
+                                                    tooltip=[
+                                                        alt.Tooltip(
+                                                            f"{mail_segment_col}:N",
+                                                            title=mail_segment_col,
+                                                        ),
+                                                        alt.Tooltip("小項目:N", title="小項目"),
+                                                        alt.Tooltip(
+                                                            f"{campaign_col}:N",
+                                                            title="キャンペーン",
+                                                        ),
+                                                        alt.Tooltip(
+                                                            f"{mail_segment_metric}:Q",
+                                                            title=mail_segment_metric,
+                                                            format=y_format,
+                                                        ),
+                                                    ],
+                                                )
+                                                .properties(height=420)
+                                            )
+                                            st.altair_chart(
+                                                segment_chart,
+                                                width="stretch",
+                                            )
+
+                                        st.download_button(
+                                            "📥 メルマガのセグメント分析をダウンロード",
+                                            to_excel(mail_segment_res),
+                                            "メルマガ分析_セグメント別.xlsx",
+                                        )
