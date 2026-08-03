@@ -369,28 +369,28 @@ def render_kpis(df: pd.DataFrame):
 def allocation_simulator(df: pd.DataFrame):
     st.subheader("💸 媒体アロケーション影響試算")
     st.caption("過去実績の媒体別効率が移管後も続く前提で、元媒体から減る成果と先媒体で増える成果の差分を試算します。")
-    if not {"大項目", "小項目", "コスト"}.issubset(df.columns):
-        st.info("大項目・小項目・コストが揃うと利用できます。")
+    if not {"中項目", "小項目", "コスト"}.issubset(df.columns):
+        st.info("中項目・小項目・コストが揃うと利用できます。")
         return
 
     def valid_options(series: pd.Series) -> list[str]:
         values = series.dropna().astype(str).str.strip()
         return sorted(v for v in values.unique().tolist() if v and v.casefold() != "nan")
 
-    bigs = valid_options(df["大項目"])
-    if not bigs:
-        st.info("現在のフィルタ条件では、選択可能な大項目がありません。")
+    middles = valid_options(df["中項目"])
+    if not middles:
+        st.info("現在のフィルタ条件では、選択可能な中項目がありません。")
         return
 
     # 依存する選択肢が変わった際、古いsession_state値が残って選択不能になるのを防ぐ。
-    if st.session_state.get("alloc_from_big") not in bigs:
-        st.session_state["alloc_from_big"] = bigs[0]
-    if st.session_state.get("alloc_to_big") not in bigs:
-        st.session_state["alloc_to_big"] = bigs[1] if len(bigs) > 1 else bigs[0]
+    if st.session_state.get("alloc_from_middle") not in middles:
+        st.session_state["alloc_from_middle"] = middles[0]
+    if st.session_state.get("alloc_to_middle") not in middles:
+        st.session_state["alloc_to_middle"] = middles[1] if len(middles) > 1 else middles[0]
 
     c1, c2, c3 = st.columns(3)
-    from_big = c1.selectbox("アロケーション元：大項目", bigs, key="alloc_from_big")
-    from_smalls = valid_options(df.loc[df["大項目"].astype(str).str.strip() == from_big, "小項目"])
+    from_middle = c1.selectbox("アロケーション元：中項目", middles, key="alloc_from_middle")
+    from_smalls = valid_options(df.loc[df["中項目"].astype(str).str.strip() == from_middle, "小項目"])
     if not from_smalls:
         c2.warning("元媒体の小項目がありません。")
         return
@@ -403,27 +403,27 @@ def allocation_simulator(df: pd.DataFrame):
     )
 
     d1, d2 = st.columns(2)
-    to_big = d1.selectbox("アロケーション先：大項目", bigs, key="alloc_to_big")
-    to_smalls = valid_options(df.loc[df["大項目"].astype(str).str.strip() == to_big, "小項目"])
+    to_middle = d1.selectbox("アロケーション先：中項目", middles, key="alloc_to_middle")
+    to_smalls = valid_options(df.loc[df["中項目"].astype(str).str.strip() == to_middle, "小項目"])
     if not to_smalls:
         d2.warning("移管先の小項目がありません。")
         return
-    preferred_to = next((v for v in to_smalls if not (to_big == from_big and v == from_small)), to_smalls[0])
+    preferred_to = next((v for v in to_smalls if not (to_middle == from_middle and v == from_small)), to_smalls[0])
     if st.session_state.get("alloc_to_small") not in to_smalls:
         st.session_state["alloc_to_small"] = preferred_to
     to_small = d2.selectbox("アロケーション先：小項目", to_smalls, key="alloc_to_small")
 
-    same_media = from_big == to_big and from_small == to_small
+    same_media = from_middle == to_middle and from_small == to_small
     if same_media:
         st.warning("アロケーション元と先が同じです。異なる媒体を選択してください。")
 
     if st.button("影響を試算", type="primary", disabled=amount <= 0 or same_media):
         source = df[
-            (df["大項目"].astype(str).str.strip() == from_big)
+            (df["中項目"].astype(str).str.strip() == from_middle)
             & (df["小項目"].astype(str).str.strip() == from_small)
         ]
         dest = df[
-            (df["大項目"].astype(str).str.strip() == to_big)
+            (df["中項目"].astype(str).str.strip() == to_middle)
             & (df["小項目"].astype(str).str.strip() == to_small)
         ]
         if source.empty or dest.empty:
@@ -562,9 +562,10 @@ with tab_media:
 
 with tab_win:
     st.subheader("勝ちパターン分析")
-    big_options = sorted(df["大項目"].dropna().astype(str).unique()) if "大項目" in df.columns else []
-    selected_big = st.selectbox("分析する大項目", ["すべて"] + big_options)
-    win_df = df if selected_big == "すべて" else df[df["大項目"].astype(str) == selected_big]
+    middle_options = sorted(df["中項目"].dropna().astype(str).str.strip().unique()) if "中項目" in df.columns else []
+    middle_options = [v for v in middle_options if v and v.casefold() != "nan"]
+    selected_middle = st.selectbox("分析する中項目", ["すべて"] + middle_options, key="win_selected_middle")
+    win_df = df if selected_middle == "すべて" else df[df["中項目"].astype(str).str.strip() == selected_middle]
     pattern_options = [c for c in ["小項目", "媒体名", "キャンペーン識別", "年齢グループ", "年収グループ", "性別", "利用目的", "都道府県"] if c in dimension_cols]
     pattern_defaults = [c for c in ["小項目", "利用目的", "年齢グループ"] if c in pattern_options]
     pattern_cols = st.multiselect("勝ちパターンの組み合わせ", pattern_options, default=pattern_defaults, key="win_pattern_cols")
