@@ -111,22 +111,58 @@ def consume_saved_preference(key, options=None, default=None, multiple=False, co
         st.session_state[key] = value
 
 
+def storage_get_item(storage, item_key, component_key=None):
+    """streamlit-local-storage の版差を吸収して値を取得する。"""
+    if storage is None:
+        return None
+    try:
+        if component_key:
+            return storage.getItem(item_key, key=component_key)
+    except TypeError:
+        # 古い版は Streamlit component 用の key 引数を受け付けない
+        pass
+    return storage.getItem(item_key)
+
+
+def storage_set_item(storage, item_key, value, component_key=None):
+    """streamlit-local-storage の版差を吸収して値を保存する。"""
+    if storage is None:
+        return None
+    try:
+        if component_key:
+            return storage.setItem(item_key, value, key=component_key)
+    except TypeError:
+        # 古い版は Streamlit component 用の key 引数を受け付けない
+        pass
+    return storage.setItem(item_key, value)
+
+
 def load_browser_preferences(storage):
     """localStorageから保存設定を読み込み、段階的適用用の待機領域へ入れる。"""
-    if storage is None:
+    if storage is None or st.session_state.get("_browser_preferences_loaded"):
         return
-    raw = storage.getItem(PREFERENCE_STORAGE_KEY, key="browser_preferences_raw")
-    if st.session_state.get("_browser_preferences_loaded"):
+
+    try:
+        raw = storage_get_item(
+            storage,
+            PREFERENCE_STORAGE_KEY,
+            component_key="browser_preferences_raw",
+        )
+    except Exception:
+        # localStorageコンポーネントの一時的な初期化失敗でアプリ全体を落とさない
+        st.session_state["_browser_preferences_loaded"] = True
         return
+
     if raw in (None, "", {}):
         return
+
     try:
         data = json.loads(raw) if isinstance(raw, str) else raw
         if isinstance(data, dict):
             st.session_state["_pending_browser_preferences"] = data
             st.session_state["_browser_preferences_loaded"] = True
             st.rerun()
-    except Exception:
+    except (TypeError, ValueError, json.JSONDecodeError):
         st.session_state["_browser_preferences_loaded"] = True
 
 
@@ -1178,16 +1214,17 @@ else:
     st.sidebar.caption("このブラウザだけに保存されます。IPアドレスが変わっても有効です。")
     if st.sidebar.button("💾 現在の設定を保存", width="stretch", key="save_browser_preferences"):
         payload = json.dumps(collect_preferences(), ensure_ascii=False)
-        local_storage.setItem(PREFERENCE_STORAGE_KEY, payload, key="save_preferences_component")
+        storage_set_item(local_storage, PREFERENCE_STORAGE_KEY, payload, component_key="save_preferences_component")
         time.sleep(0.8)
         st.sidebar.success("このブラウザに設定を保存しました。")
 
     if st.sidebar.button("↩️ 保存設定を初期化", width="stretch", key="reset_browser_preferences"):
-        local_storage.setItem(PREFERENCE_STORAGE_KEY, "", key="reset_preferences_component")
+        storage_set_item(local_storage, PREFERENCE_STORAGE_KEY, "", component_key="reset_preferences_component")
         for pref_key in PREFERENCE_KEYS:
             st.session_state.pop(pref_key, None)
         st.session_state.pop("_pending_browser_preferences", None)
         st.session_state["_browser_preferences_loaded"] = True
         time.sleep(0.8)
         st.rerun()
+
 
