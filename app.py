@@ -49,7 +49,8 @@ st.markdown(
 # ======================
 # ブラウザ別設定保存
 # ======================
-PREFERENCE_STORAGE_KEY = "rear_numeric_analysis_preferences_v1"
+PREFERENCE_STORAGE_KEY = "rear_numeric_analysis_preferences_v2"
+PREFERENCE_SCHEMA_VERSION = 2
 PREFERENCE_KEYS = [
     "data_sheet", "master_sheet", "use_cost_sheet", "cost_sheet",
     "filter_date_range", "filter_big", "filter_middle", "filter_small",
@@ -81,8 +82,20 @@ def serializable_value(value):
     return value
 
 
-def consume_saved_preference(key, options=None, default=None, multiple=False, converter=None):
-    """保存値を各ウィジェット生成前に一度だけ適用し、候補外の値は除外する。"""
+def consume_saved_preference(
+    key,
+    options=None,
+    default=None,
+    multiple=False,
+    converter=None,
+    allow_empty_saved=False,
+):
+    """コード側デフォルトを土台にし、保存済みの有効な値だけを上書きする。
+
+    - 保存値がない場合は、各ウィジェットに指定したデフォルトをそのまま使う。
+    - 保存値が候補外・壊れている・空になってはいけない項目で空の場合は、デフォルトへ戻す。
+    - フィルタのように空欄＝すべてを意味する項目は allow_empty_saved=True で空を許可できる。
+    """
     pending = st.session_state.get("_pending_browser_preferences", {})
     if key not in pending:
         return
@@ -99,13 +112,18 @@ def consume_saved_preference(key, options=None, default=None, multiple=False, co
     if options is not None:
         valid = list(options)
         if multiple:
-            values = value if isinstance(value, list) else [value]
+            values = value if isinstance(value, list) else ([] if value is None else [value])
             value = [v for v in values if v in valid]
-            if not value and default is not None:
-                value = list(default) if isinstance(default, (list, tuple)) else [default]
+            if not value and not allow_empty_saved:
+                value = list(default) if isinstance(default, (list, tuple)) else ([] if default is None else [default])
         else:
             if value not in valid:
                 value = default if default in valid else (valid[0] if valid else None)
+    elif multiple and value in (None, ""):
+        value = [] if allow_empty_saved else (list(default) if isinstance(default, (list, tuple)) else default)
+
+    if value is None and default is not None:
+        value = default
 
     if value is not None:
         st.session_state[key] = value
@@ -154,14 +172,26 @@ def load_browser_preferences(storage):
         return
 
     if raw in (None, "", {}):
+        st.session_state["_browser_preferences_loaded"] = True
         return
 
     try:
         data = json.loads(raw) if isinstance(raw, str) else raw
         if isinstance(data, dict):
-            st.session_state["_pending_browser_preferences"] = data
+            # v2以降は保存値をenvelope化。旧形式も念のため読み取れる。
+            if "values" in data:
+                version = data.get("schema_version")
+                values = data.get("values", {})
+                if version != PREFERENCE_SCHEMA_VERSION or not isinstance(values, dict):
+                    values = {}
+            else:
+                values = data
+
+            st.session_state["_pending_browser_preferences"] = values
             st.session_state["_browser_preferences_loaded"] = True
             st.rerun()
+        else:
+            st.session_state["_browser_preferences_loaded"] = True
     except (TypeError, ValueError, json.JSONDecodeError):
         st.session_state["_browser_preferences_loaded"] = True
 
@@ -456,7 +486,7 @@ def selection_filter(df: pd.DataFrame, column: str, label: str, key: str) -> pd.
         st.sidebar.caption(f"{label}: 現在選択可能な値なし")
         return df
 
-    consume_saved_preference(key, choices, default=[], multiple=True)
+    consume_saved_preference(key, choices, default=[], multiple=True, allow_empty_saved=True)
     selected = st.sidebar.multiselect(
         label,
         choices,
@@ -1211,9 +1241,9 @@ st.sidebar.subheader("⚙️ 個人設定")
 if LocalStorage is None:
     st.sidebar.warning("ブラウザ保存機能を使うには requirements.txt に streamlit-local-storage を追加してください。")
 else:
-    st.sidebar.caption("このブラウザだけに保存されます。IPアドレスが変わっても有効です。")
+    st.sidebar.caption("コード側のデフォルトを維持し、保存した項目だけこのブラウザで復元します。IPアドレスが変わっても有効です。")
     if st.sidebar.button("💾 現在の設定を保存", width="stretch", key="save_browser_preferences"):
-        payload = json.dumps(collect_preferences(), ensure_ascii=False)
+        payload = json.dumps({"schema_version": PREFERENCE_SCHEMA_VERSION, "values": collect_preferences()}, ensure_ascii=False)
         storage_set_item(local_storage, PREFERENCE_STORAGE_KEY, payload, component_key="save_preferences_component")
         time.sleep(0.8)
         st.sidebar.success("このブラウザに設定を保存しました。")
@@ -1226,5 +1256,4 @@ else:
         st.session_state["_browser_preferences_loaded"] = True
         time.sleep(0.8)
         st.rerun()
-
 
