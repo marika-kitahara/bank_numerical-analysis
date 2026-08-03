@@ -1,5 +1,7 @@
-python-pptx
-plotly
+streamlit
 pandas
 openpyxl
-kaleido   # Plotly画像出力用
+altair
+plotly
+kaleido
+streamlit-local-storage
