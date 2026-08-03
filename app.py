@@ -217,12 +217,27 @@ def aggregate(df: pd.DataFrame, group_cols: list[str]) -> pd.DataFrame:
 
 
 def add_extra_numeric_sums(df: pd.DataFrame, result: pd.DataFrame, group_cols: list[str], selected: list[str]) -> pd.DataFrame:
-    extra = [c for c in selected if c not in CORE_METRICS and c in df.columns and pd.api.types.is_numeric_dtype(df[c])]
+    # 集計軸が数値型として読み込まれていても、表示項目側へ重複追加しない。
+    # 例：空欄が多い「大項目」がfloat型になった場合、reset_index時に列名衝突していた。
+    group_cols = list(dict.fromkeys(c for c in group_cols if c in df.columns))
+    selected = list(dict.fromkeys(selected))
+    extra = [
+        c for c in selected
+        if c not in CORE_METRICS
+        and c not in group_cols
+        and c not in result.columns
+        and c in df.columns
+        and pd.api.types.is_numeric_dtype(df[c])
+    ]
     if not extra:
         return result
     if group_cols:
-        sums = df.groupby(group_cols, dropna=False, observed=True)[extra].sum(min_count=1).reset_index()
-        return result.merge(sums, on=group_cols, how="left")
+        sums = (
+            df.groupby(group_cols, dropna=False, observed=True)[extra]
+            .sum(min_count=1)
+            .reset_index()
+        )
+        return result.merge(sums, on=group_cols, how="left", validate="one_to_one")
     for col in extra:
         result[col] = df[col].sum(min_count=1)
     return result
@@ -243,9 +258,21 @@ def to_excel(df: pd.DataFrame) -> bytes:
 
 
 def metric_options(df: pd.DataFrame) -> list[str]:
-    excluded = {"申込フラグ", "承認フラグ", "成約フラグ", "コスト_元データ", "コスト補完フラグ", "媒体月申込件数", "補完元コスト"}
-    extras = [c for c in df.select_dtypes(include="number").columns if c not in excluded and c not in CORE_METRICS]
-    return CORE_METRICS + [c for c in extras if c not in CORE_METRICS]
+    # 分類・識別系の列は、Excel上で全空欄だと数値型(float)判定されることがある。
+    # それらを表示指標に混ぜず、実際の数値項目だけを候補にする。
+    excluded = {
+        "申込フラグ", "承認フラグ", "成約フラグ", "コスト_元データ",
+        "コスト補完フラグ", "媒体月申込件数", "補完元コスト",
+        "媒体コード", "テンプレコード", "メニュー名", "大項目", "中項目",
+        "小項目", "小項目2", "代理店コード", "配信日", "ポイント",
+        "キャンペーン識別", "メニューコード", "コストフラグ", "媒体名", "媒体",
+        "申込月",
+    }
+    extras = [
+        c for c in df.select_dtypes(include="number").columns
+        if c not in excluded and c not in CORE_METRICS
+    ]
+    return list(dict.fromkeys(CORE_METRICS + extras))
 
 
 def selection_filter(df: pd.DataFrame, column: str, label: str, key: str) -> pd.DataFrame:
@@ -259,14 +286,44 @@ def selection_filter(df: pd.DataFrame, column: str, label: str, key: str) -> pd.
 def render_kpis(df: pd.DataFrame):
     kpi = aggregate(df, [])
     row = kpi.iloc[0]
-    cols = st.columns(7)
-    cols[0].metric("申込件数", f"{row['申込件数']:,.0f}")
-    cols[1].metric("承認件数", f"{row['承認件数']:,.0f}")
-    cols[2].metric("承認率", f"{row['承認率']:.1%}" if pd.notna(row["承認率"]) else "-")
-    cols[3].metric("コスト", f"¥{row['コスト']:,.0f}")
-    cols[4].metric("申込CPA", f"¥{row['申込CPA']:,.0f}" if pd.notna(row["申込CPA"]) else "-")
-    cols[5].metric("承認CPA", f"¥{row['承認CPA']:,.0f}" if pd.notna(row["承認CPA"]) else "-")
-    cols[6].metric("投下倍率", f"{row['投下倍率']:.2f}" if pd.notna(row["投下倍率"]) else "-")
+
+    st.markdown(
+        """
+        <style>
+        div[data-testid="stMetric"] {
+            background: #ffffff;
+            border: 1px solid rgba(49, 51, 63, 0.18);
+            border-radius: 12px;
+            padding: 14px 16px;
+            min-height: 112px;
+            box-shadow: 0 2px 7px rgba(0, 0, 0, 0.05);
+        }
+        div[data-testid="stMetricLabel"] p {
+            font-size: 0.95rem !important;
+            font-weight: 700 !important;
+        }
+        div[data-testid="stMetricValue"] {
+            font-size: clamp(1.45rem, 2.1vw, 2.15rem) !important;
+            line-height: 1.15 !important;
+            overflow: visible !important;
+            white-space: nowrap !important;
+        }
+        </style>
+        """,
+        unsafe_allow_html=True,
+    )
+
+    # 7枚を一列に詰め込むと金額が省略されるため、4枚＋3枚の二段表示にする。
+    first = st.columns(4)
+    first[0].metric("申込件数", f"{row['申込件数']:,.0f}")
+    first[1].metric("承認件数", f"{row['承認件数']:,.0f}")
+    first[2].metric("承認率", f"{row['承認率']:.1%}" if pd.notna(row["承認率"]) else "-")
+    first[3].metric("コスト", f"¥{row['コスト']:,.0f}" if pd.notna(row["コスト"]) else "-")
+
+    second = st.columns(3)
+    second[0].metric("申込CPA", f"¥{row['申込CPA']:,.0f}" if pd.notna(row["申込CPA"]) else "-")
+    second[1].metric("承認CPA", f"¥{row['承認CPA']:,.0f}" if pd.notna(row["承認CPA"]) else "-")
+    second[2].metric("投下倍率", f"{row['投下倍率']:.2f}" if pd.notna(row["投下倍率"]) else "-")
 
 
 def allocation_simulator(df: pd.DataFrame):
@@ -398,7 +455,7 @@ with tab_media:
     selected_metrics = st.multiselect("表示項目", all_metrics, default=default_metrics, key="media_metrics")
     res = aggregate(df, groups)
     res = add_extra_numeric_sums(df, res, groups, selected_metrics)
-    display_cols = groups + [m for m in selected_metrics if m in res.columns]
+    display_cols = list(dict.fromkeys(groups + [m for m in selected_metrics if m in res.columns]))
     st.dataframe(format_table(res[display_cols]), use_container_width=True, hide_index=True)
     st.download_button("📥 媒体分析をダウンロード", to_excel(res[display_cols]), "媒体分析.xlsx")
 
@@ -490,4 +547,3 @@ with tab_mail:
             g1.bar_chart(mail_res.set_index(campaign_col)[[metric1]])
             g2.bar_chart(mail_res.set_index(campaign_col)[[metric2]])
             st.download_button("📥 メルマガ分析をダウンロード", to_excel(mail_res), "メルマガ分析.xlsx")
-
