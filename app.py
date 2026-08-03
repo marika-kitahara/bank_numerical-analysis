@@ -372,21 +372,63 @@ def allocation_simulator(df: pd.DataFrame):
         st.info("大項目・小項目・コストが揃うと利用できます。")
         return
 
+    def valid_options(series: pd.Series) -> list[str]:
+        values = series.dropna().astype(str).str.strip()
+        return sorted(v for v in values.unique().tolist() if v and v.casefold() != "nan")
+
+    bigs = valid_options(df["大項目"])
+    if not bigs:
+        st.info("現在のフィルタ条件では、選択可能な大項目がありません。")
+        return
+
+    # 依存する選択肢が変わった際、古いsession_state値が残って選択不能になるのを防ぐ。
+    if st.session_state.get("alloc_from_big") not in bigs:
+        st.session_state["alloc_from_big"] = bigs[0]
+    if st.session_state.get("alloc_to_big") not in bigs:
+        st.session_state["alloc_to_big"] = bigs[1] if len(bigs) > 1 else bigs[0]
+
     c1, c2, c3 = st.columns(3)
-    bigs = sorted(df["大項目"].dropna().astype(str).unique())
     from_big = c1.selectbox("アロケーション元：大項目", bigs, key="alloc_from_big")
-    from_smalls = sorted(df.loc[df["大項目"].astype(str) == from_big, "小項目"].dropna().astype(str).unique())
+    from_smalls = valid_options(df.loc[df["大項目"].astype(str).str.strip() == from_big, "小項目"])
+    if not from_smalls:
+        c2.warning("元媒体の小項目がありません。")
+        return
+    if st.session_state.get("alloc_from_small") not in from_smalls:
+        st.session_state["alloc_from_small"] = from_smalls[0]
     from_small = c2.selectbox("アロケーション元：小項目", from_smalls, key="alloc_from_small")
-    amount = c3.number_input("移管金額（円）", min_value=0.0, step=10000.0, format="%.0f")
+    amount = c3.number_input(
+        "移管金額（円）", min_value=0.0, value=500000.0,
+        step=10000.0, format="%.0f", key="alloc_amount"
+    )
 
     d1, d2 = st.columns(2)
     to_big = d1.selectbox("アロケーション先：大項目", bigs, key="alloc_to_big")
-    to_smalls = sorted(df.loc[df["大項目"].astype(str) == to_big, "小項目"].dropna().astype(str).unique())
+    to_smalls = valid_options(df.loc[df["大項目"].astype(str).str.strip() == to_big, "小項目"])
+    if not to_smalls:
+        d2.warning("移管先の小項目がありません。")
+        return
+    preferred_to = next((v for v in to_smalls if not (to_big == from_big and v == from_small)), to_smalls[0])
+    if st.session_state.get("alloc_to_small") not in to_smalls:
+        st.session_state["alloc_to_small"] = preferred_to
     to_small = d2.selectbox("アロケーション先：小項目", to_smalls, key="alloc_to_small")
 
-    if st.button("影響を試算", type="primary", disabled=amount <= 0):
-        source = df[(df["大項目"].astype(str) == from_big) & (df["小項目"].astype(str) == from_small)]
-        dest = df[(df["大項目"].astype(str) == to_big) & (df["小項目"].astype(str) == to_small)]
+    same_media = from_big == to_big and from_small == to_small
+    if same_media:
+        st.warning("アロケーション元と先が同じです。異なる媒体を選択してください。")
+
+    if st.button("影響を試算", type="primary", disabled=amount <= 0 or same_media):
+        source = df[
+            (df["大項目"].astype(str).str.strip() == from_big)
+            & (df["小項目"].astype(str).str.strip() == from_small)
+        ]
+        dest = df[
+            (df["大項目"].astype(str).str.strip() == to_big)
+            & (df["小項目"].astype(str).str.strip() == to_small)
+        ]
+        if source.empty or dest.empty:
+            st.error("元または先媒体の対象データがありません。")
+            return
+
         s = aggregate(source, []).iloc[0]
         d = aggregate(dest, []).iloc[0]
         if s["コスト"] <= 0 or d["コスト"] <= 0:
@@ -489,7 +531,7 @@ tab_media, tab_win, tab_cross, tab_seg, tab_mail = st.tabs([
 with tab_media:
     st.subheader("媒体分析")
     default_groups = [c for c in ["大項目", "中項目", "小項目", "キャンペーン識別"] if c in dimension_cols]
-    groups = st.multiselect("集計軸", dimension_cols, default=default_groups[:2], key="media_groups")
+    groups = st.multiselect("集計軸", dimension_cols, default=default_groups[:3], key="media_groups")
     default_metrics = [m for m in CORE_METRICS if m in all_metrics]
     metric_actions = st.columns([1, 1, 6])
     if metric_actions[0].button("全選択", key="media_select_all"):
@@ -510,7 +552,7 @@ with tab_media:
         st.download_button("📥 媒体分析をダウンロード", to_excel(media_output), "媒体分析.xlsx")
 
     if "申込日" in df.columns and groups:
-        trend_group = st.selectbox("日次推移の系列", groups, key="media_trend_group")
+        trend_group = st.selectbox("日次推移の系列", groups, index=groups.index("中項目") if "中項目" in groups else 0, key="media_trend_group")
         trend_metric = st.selectbox("日次推移の指標", [m for m in selected_metrics if m in CORE_METRICS] or ["申込件数"], key="media_trend_metric")
         daily_df = df.copy(); daily_df["日付"] = daily_df["申込日"].dt.date
         daily = aggregate(daily_df, ["日付", trend_group])
@@ -523,7 +565,8 @@ with tab_win:
     selected_big = st.selectbox("分析する大項目", ["すべて"] + big_options)
     win_df = df if selected_big == "すべて" else df[df["大項目"].astype(str) == selected_big]
     pattern_options = [c for c in ["小項目", "媒体名", "キャンペーン識別", "年齢グループ", "年収グループ", "性別", "利用目的", "都道府県"] if c in dimension_cols]
-    pattern_cols = st.multiselect("勝ちパターンの組み合わせ", pattern_options, default=pattern_options[:2])
+    pattern_defaults = [c for c in ["小項目", "利用目的", "年齢グループ"] if c in pattern_options]
+    pattern_cols = st.multiselect("勝ちパターンの組み合わせ", pattern_options, default=pattern_defaults, key="win_pattern_cols")
     target_metric = st.selectbox("最大化する指標", ["承認率", "申込件数", "投下倍率", "取扱金額_翌月", "申込CPA", "承認CPA", "成約件数", "成約率"])
     min_count = st.number_input("最低申込件数", min_value=1, value=30, step=10)
     if pattern_cols:
@@ -542,7 +585,7 @@ with tab_win:
 
 with tab_cross:
     st.subheader("クロス分析")
-    x = st.selectbox("X軸", dimension_cols, index=dimension_cols.index("小項目") if "小項目" in dimension_cols else 0, key="cross_x")
+    x = st.selectbox("X軸", dimension_cols, index=dimension_cols.index("年齢グループ") if "年齢グループ" in dimension_cols else 0, key="cross_x")
     y = st.selectbox("Y軸", dimension_cols, index=dimension_cols.index("利用目的") if "利用目的" in dimension_cols else min(1, len(dimension_cols)-1), key="cross_y")
     metric = st.selectbox("指標", [m for m in CORE_METRICS if m in all_metrics], key="cross_metric")
     if x != y:
@@ -571,7 +614,7 @@ with tab_cross:
 
 with tab_seg:
     st.subheader("セグメント別分析")
-    seg = st.selectbox("分析項目", dimension_cols, key="seg_col")
+    seg = st.selectbox("分析項目", dimension_cols, index=dimension_cols.index("小項目") if "小項目" in dimension_cols else 0, key="seg_col")
     chart_metric = st.selectbox("縦棒グラフの指標", [m for m in CORE_METRICS if m in all_metrics], key="seg_metric")
     seg_res = aggregate(df, [seg])
     toggle = seg_res[[seg]].copy()
@@ -595,21 +638,88 @@ with tab_mail:
     if "中項目" not in df.columns:
         st.info("中項目列がありません。")
     else:
-        mail_df = df[df["中項目"].astype(str).str.casefold() == "mail".casefold()]
+        mail_df = df[df["中項目"].astype(str).str.strip().str.casefold() == "mail"]
         if mail_df.empty:
             st.info("現在の共通フィルタ条件では、中項目『Mail』のデータがありません。")
+        elif "小項目" not in mail_df.columns:
+            st.info("小項目列がないため、小項目別のメルマガ分析を表示できません。")
         else:
-            campaign_col = "キャンペーン識別" if "キャンペーン識別" in mail_df.columns else "小項目"
-            campaigns = sorted(mail_df[campaign_col].dropna().astype(str).unique())
-            selected_campaigns = st.multiselect("キャンペーン", campaigns, default=campaigns[: min(5, len(campaigns))])
-            target = mail_df[mail_df[campaign_col].astype(str).isin(selected_campaigns)] if selected_campaigns else mail_df
-            mail_res = aggregate(target, [campaign_col])
-            mail_metrics = st.multiselect("表示項目", CORE_METRICS, default=CORE_METRICS)
-            st.dataframe(format_table(mail_res[[campaign_col] + mail_metrics]), use_container_width=True, hide_index=True)
+            small_options = sorted(
+                v for v in mail_df["小項目"].dropna().astype(str).str.strip().unique().tolist()
+                if v and v.casefold() != "nan"
+            )
+            selected_smalls = st.multiselect(
+                "表示する小項目（複数選択可）",
+                small_options,
+                default=small_options[: min(5, len(small_options))],
+                key="mail_smalls",
+            )
+            if not selected_smalls:
+                st.info("表示する小項目を1つ以上選択してください。")
+            else:
+                target_small_df = mail_df[mail_df["小項目"].astype(str).str.strip().isin(selected_smalls)]
+                campaign_col = "キャンペーン識別" if "キャンペーン識別" in target_small_df.columns else "小項目2"
+                if campaign_col not in target_small_df.columns:
+                    st.info("キャンペーン識別に使用できる列がありません。")
+                else:
+                    campaigns = sorted(
+                        v for v in target_small_df[campaign_col].dropna().astype(str).str.strip().unique().tolist()
+                        if v and v.casefold() != "nan"
+                    )
+                    selected_campaigns = st.multiselect(
+                        "キャンペーン",
+                        campaigns,
+                        default=campaigns[: min(10, len(campaigns))],
+                        key="mail_campaigns",
+                    )
+                    target = (
+                        target_small_df[target_small_df[campaign_col].astype(str).str.strip().isin(selected_campaigns)]
+                        if selected_campaigns else target_small_df
+                    )
 
-            g1, g2 = st.columns(2)
-            metric1 = g1.selectbox("比較グラフ1の指標", CORE_METRICS, index=0)
-            metric2 = g2.selectbox("比較グラフ2の指標", CORE_METRICS, index=CORE_METRICS.index("承認率"))
-            g1.bar_chart(mail_res.set_index(campaign_col)[[metric1]])
-            g2.bar_chart(mail_res.set_index(campaign_col)[[metric2]])
-            st.download_button("📥 メルマガ分析をダウンロード", to_excel(mail_res), "メルマガ分析.xlsx")
+                    mail_metrics = st.multiselect(
+                        "表示項目",
+                        CORE_METRICS,
+                        default=CORE_METRICS,
+                        key="mail_metrics",
+                    )
+                    g1, g2 = st.columns(2)
+                    metric1 = g1.selectbox("比較グラフ1の指標", CORE_METRICS, index=0, key="mail_metric1")
+                    metric2 = g2.selectbox(
+                        "比較グラフ2の指標",
+                        CORE_METRICS,
+                        index=CORE_METRICS.index("承認率"),
+                        key="mail_metric2",
+                    )
+
+                    # 全選択小項目をまとめた一覧。小項目ごとの行として確認・出力できる。
+                    all_mail_res = aggregate(target, ["小項目", campaign_col])
+                    display_mail_cols = ["小項目", campaign_col] + [m for m in mail_metrics if m in all_mail_res.columns]
+                    st.subheader("小項目別一覧")
+                    st.dataframe(
+                        format_table(all_mail_res[display_mail_cols]),
+                        use_container_width=True,
+                        hide_index=True,
+                    )
+
+                    st.subheader("小項目ごとの比較")
+                    for small in selected_smalls:
+                        small_target = target[target["小項目"].astype(str).str.strip() == small]
+                        if small_target.empty:
+                            continue
+                        small_res = aggregate(small_target, [campaign_col])
+                        with st.expander(f"小項目：{small}", expanded=True):
+                            cols = [campaign_col] + [m for m in mail_metrics if m in small_res.columns]
+                            st.dataframe(format_table(small_res[cols]), use_container_width=True, hide_index=True)
+                            chart1, chart2 = st.columns(2)
+                            chart1.caption(metric1)
+                            chart1.bar_chart(small_res.set_index(campaign_col)[[metric1]])
+                            chart2.caption(metric2)
+                            chart2.bar_chart(small_res.set_index(campaign_col)[[metric2]])
+
+                    st.download_button(
+                        "📥 メルマガ分析をダウンロード",
+                        to_excel(all_mail_res),
+                        "メルマガ分析_小項目別.xlsx",
+                    )
+
