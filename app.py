@@ -2,6 +2,7 @@ import re
 from io import BytesIO
 
 import numpy as np
+import altair as alt
 import pandas as pd
 import streamlit as st
 
@@ -635,151 +636,210 @@ with tab_seg:
 
 with tab_mail:
     st.subheader("メルマガ分析（中項目 = Mail）")
+
     if "中項目" not in df.columns:
         st.info("中項目列がありません。")
     else:
-        mail_df = df[df["中項目"].astype(str).str.strip().str.casefold() == "mail"]
+        mail_df = df[df["中項目"].astype(str).str.strip().str.casefold() == "mail"].copy()
+
         if mail_df.empty:
             st.info("現在の共通フィルタ条件では、中項目『Mail』のデータがありません。")
         elif "小項目" not in mail_df.columns:
             st.info("小項目列がないため、小項目別のメルマガ分析を表示できません。")
         else:
+            mail_df["小項目"] = mail_df["小項目"].astype(str).str.strip()
             small_options = sorted(
-                v for v in mail_df["小項目"].dropna().astype(str).str.strip().unique().tolist()
+                v for v in mail_df["小項目"].dropna().unique().tolist()
                 if v and v.casefold() != "nan"
             )
+
+            # 共通フィルタやファイル変更で候補が変わっても、古い選択値を残さない。
+            saved_smalls = st.session_state.get("mail_smalls", small_options[: min(5, len(small_options))])
+            if not isinstance(saved_smalls, list):
+                saved_smalls = [saved_smalls]
+            saved_smalls = [v for v in saved_smalls if v in small_options]
+            if not saved_smalls and small_options:
+                saved_smalls = small_options[: min(5, len(small_options))]
+            st.session_state["mail_smalls"] = saved_smalls
+
             selected_smalls = st.multiselect(
                 "表示する小項目（複数選択可）",
                 small_options,
-                default=small_options[: min(5, len(small_options))],
                 key="mail_smalls",
             )
+
             if not selected_smalls:
                 st.info("表示する小項目を1つ以上選択してください。")
             else:
-                target_small_df = mail_df[mail_df["小項目"].astype(str).str.strip().isin(selected_smalls)]
+                target_small_df = mail_df[mail_df["小項目"].isin(selected_smalls)].copy()
                 campaign_col = "キャンペーン識別" if "キャンペーン識別" in target_small_df.columns else "小項目2"
+
                 if campaign_col not in target_small_df.columns:
                     st.info("キャンペーン識別に使用できる列がありません。")
                 else:
+                    target_small_df[campaign_col] = target_small_df[campaign_col].astype(str).str.strip()
                     campaigns = sorted(
-                        v for v in target_small_df[campaign_col].dropna().astype(str).str.strip().unique().tolist()
+                        v for v in target_small_df[campaign_col].dropna().unique().tolist()
                         if v and v.casefold() != "nan"
                     )
+
+                    # 小項目を変更するとキャンペーン候補も変わるため、無効な選択値を先に除外する。
+                    saved_campaigns = st.session_state.get(
+                        "mail_campaigns", campaigns[: min(10, len(campaigns))]
+                    )
+                    if not isinstance(saved_campaigns, list):
+                        saved_campaigns = [saved_campaigns]
+                    saved_campaigns = [v for v in saved_campaigns if v in campaigns]
+                    if not saved_campaigns and campaigns:
+                        saved_campaigns = campaigns[: min(10, len(campaigns))]
+                    st.session_state["mail_campaigns"] = saved_campaigns
+
                     selected_campaigns = st.multiselect(
-                        "キャンペーン",
+                        "キャンペーン（複数選択可）",
                         campaigns,
-                        default=campaigns[: min(10, len(campaigns))],
                         key="mail_campaigns",
                     )
-                    target = (
-                        target_small_df[target_small_df[campaign_col].astype(str).str.strip().isin(selected_campaigns)]
-                        if selected_campaigns else target_small_df
-                    )
 
-                    # 先に集計結果を作り、実際に生成できた指標だけをUI候補にする。
-                    # 表示項目を変更した際、存在しない列や古いsession_state値が残って
-                    # DataFrame列選択で落ちる問題を防ぐ。
-                    all_mail_res = aggregate(target, ["小項目", campaign_col])
-                    available_mail_metrics = [m for m in CORE_METRICS if m in all_mail_res.columns]
-
-                    if not available_mail_metrics:
-                        st.info("集計可能な表示項目がありません。")
-                        st.stop()
-
-                    # デプロイ更新前の選択値がsession_stateに残っている場合も安全に補正する。
-                    saved_mail_metrics = st.session_state.get("mail_metrics", ["申込件数"])
-                    if not isinstance(saved_mail_metrics, list):
-                        saved_mail_metrics = [saved_mail_metrics]
-                    saved_mail_metrics = [m for m in saved_mail_metrics if m in available_mail_metrics]
-                    if not saved_mail_metrics:
-                        saved_mail_metrics = ["申込件数"] if "申込件数" in available_mail_metrics else [available_mail_metrics[0]]
-                    st.session_state["mail_metrics"] = saved_mail_metrics
-
-                    mail_metrics = st.multiselect(
-                        "表示項目",
-                        available_mail_metrics,
-                        default=["申込件数"] if "申込件数" in available_mail_metrics else [available_mail_metrics[0]],
-                        key="mail_metrics",
-                    )
-
-                    # グラフ側の古い選択値も、現在利用可能な候補へ補正する。
-                    if st.session_state.get("mail_metric1") not in available_mail_metrics:
-                        st.session_state["mail_metric1"] = "申込件数" if "申込件数" in available_mail_metrics else available_mail_metrics[0]
-                    default_metric2 = "承認率" if "承認率" in available_mail_metrics else available_mail_metrics[min(1, len(available_mail_metrics) - 1)]
-                    if st.session_state.get("mail_metric2") not in available_mail_metrics:
-                        st.session_state["mail_metric2"] = default_metric2
-
-                    g1, g2 = st.columns(2)
-                    metric1 = g1.selectbox(
-                        "比較グラフ1の指標",
-                        available_mail_metrics,
-                        index=available_mail_metrics.index("申込件数") if "申込件数" in available_mail_metrics else 0,
-                        key="mail_metric1",
-                    )
-                    metric2 = g2.selectbox(
-                        "比較グラフ2の指標",
-                        available_mail_metrics,
-                        index=available_mail_metrics.index(default_metric2),
-                        key="mail_metric2",
-                    )
-
-                    # 小項目・キャンペーン列は常に残し、表示指標が未選択でも落とさない。
-                    display_mail_cols = list(dict.fromkeys(
-                        ["小項目", campaign_col] + [m for m in mail_metrics if m in all_mail_res.columns]
-                    ))
-                    st.subheader("小項目別一覧")
-                    if mail_metrics:
-                        st.dataframe(
-                            format_table(all_mail_res.loc[:, display_mail_cols]),
-                            width="stretch",
-                            hide_index=True,
-                        )
+                    if not selected_campaigns:
+                        st.info("比較するキャンペーンを1つ以上選択してください。")
                     else:
-                        st.info("表示項目を1つ以上選択してください。")
-                        st.dataframe(
-                            all_mail_res.loc[:, list(dict.fromkeys(["小項目", campaign_col]))],
-                            width="stretch",
-                            hide_index=True,
-                        )
+                        target = target_small_df[
+                            target_small_df[campaign_col].isin(selected_campaigns)
+                        ].copy()
 
-                    st.subheader("小項目・キャンペーン比較グラフ")
-                    st.caption(
-                        "横軸を小項目、系列をキャンペーンとして、選択した小項目を同じグラフ内で比較します。"
-                    )
-
-                    # 小項目を横軸、キャンペーンを系列にした集合縦棒グラフ。
-                    # Streamlitのbar_chartでは、DataFrameの各列が系列として横並び表示される。
-                    chart_source = aggregate(target, ["小項目", campaign_col])
-
-                    chart_left, chart_right = st.columns(2)
-                    for chart_area, metric, chart_key in [
-                        (chart_left, metric1, "mail_chart_1"),
-                        (chart_right, metric2, "mail_chart_2"),
-                    ]:
-                        chart_area.markdown(f"#### {metric}")
-                        if metric not in chart_source.columns:
-                            chart_area.info(f"{metric}を集計できません。")
-                            continue
-
-                        metric_pivot = chart_source.pivot_table(
-                            index="小項目",
-                            columns=campaign_col,
-                            values=metric,
-                            aggfunc="sum",
-                        )
-                        metric_pivot = metric_pivot.reindex(selected_smalls)
-
-                        # 選択順を維持し、全欠損の系列だけ除外する。
-                        metric_pivot = metric_pivot.dropna(axis=1, how="all")
-                        if metric_pivot.empty or len(metric_pivot.columns) == 0:
-                            chart_area.info("表示できるデータがありません。")
+                        if target.empty:
+                            st.info("選択条件に該当するデータがありません。")
                         else:
-                            chart_area.bar_chart(metric_pivot, width="stretch")
+                            mail_res = aggregate(target, ["小項目", campaign_col])
+                            available_mail_metrics = [m for m in CORE_METRICS if m in mail_res.columns]
 
-                    st.download_button(
-                        "📥 メルマガ分析をダウンロード",
-                        to_excel(all_mail_res),
-                        "メルマガ分析_小項目別.xlsx",
-                    )
+                            if not available_mail_metrics:
+                                st.info("集計可能な表示項目がありません。")
+                            else:
+                                # 一覧表のデフォルト表示は申込件数。
+                                saved_mail_metrics = st.session_state.get("mail_metrics", ["申込件数"])
+                                if not isinstance(saved_mail_metrics, list):
+                                    saved_mail_metrics = [saved_mail_metrics]
+                                saved_mail_metrics = [m for m in saved_mail_metrics if m in available_mail_metrics]
+                                if not saved_mail_metrics:
+                                    saved_mail_metrics = (
+                                        ["申込件数"] if "申込件数" in available_mail_metrics
+                                        else [available_mail_metrics[0]]
+                                    )
+                                st.session_state["mail_metrics"] = saved_mail_metrics
 
+                                mail_metrics = st.multiselect(
+                                    "一覧表の表示項目",
+                                    available_mail_metrics,
+                                    key="mail_metrics",
+                                )
+
+                                default_metric1 = (
+                                    "申込件数" if "申込件数" in available_mail_metrics
+                                    else available_mail_metrics[0]
+                                )
+                                default_metric2 = (
+                                    "承認率" if "承認率" in available_mail_metrics
+                                    else available_mail_metrics[min(1, len(available_mail_metrics) - 1)]
+                                )
+
+                                if st.session_state.get("mail_metric1") not in available_mail_metrics:
+                                    st.session_state["mail_metric1"] = default_metric1
+                                if st.session_state.get("mail_metric2") not in available_mail_metrics:
+                                    st.session_state["mail_metric2"] = default_metric2
+
+                                g1, g2 = st.columns(2)
+                                metric1 = g1.selectbox(
+                                    "比較グラフ1の指標",
+                                    available_mail_metrics,
+                                    key="mail_metric1",
+                                )
+                                metric2 = g2.selectbox(
+                                    "比較グラフ2の指標",
+                                    available_mail_metrics,
+                                    key="mail_metric2",
+                                )
+
+                                display_cols = list(dict.fromkeys(
+                                    ["小項目", campaign_col]
+                                    + [m for m in mail_metrics if m in mail_res.columns]
+                                ))
+                                st.subheader("小項目別一覧")
+                                st.dataframe(
+                                    format_table(mail_res.loc[:, display_cols]),
+                                    width="stretch",
+                                    hide_index=True,
+                                )
+
+                                st.subheader("小項目・キャンペーン比較グラフ")
+                                st.caption(
+                                    "1グラフにつき1指標を表示します。横軸は小項目、同じ小項目内でキャンペーンを横並びに比較します。"
+                                )
+
+                                # Altairで xOffset を指定し、積み上げではなく集合縦棒に固定する。
+                                chart_source = mail_res[["小項目", campaign_col] + list(dict.fromkeys([metric1, metric2]))].copy()
+                                chart_source["小項目"] = pd.Categorical(
+                                    chart_source["小項目"], categories=selected_smalls, ordered=True
+                                )
+                                chart_source[campaign_col] = pd.Categorical(
+                                    chart_source[campaign_col], categories=selected_campaigns, ordered=True
+                                )
+
+                                def draw_grouped_mail_chart(container, metric):
+                                    container.markdown(f"#### {metric}")
+                                    if metric not in chart_source.columns:
+                                        container.info(f"{metric}を集計できません。")
+                                        return
+
+                                    plot_df = chart_source[["小項目", campaign_col, metric]].dropna(subset=[metric]).copy()
+                                    if plot_df.empty:
+                                        container.info("表示できるデータがありません。")
+                                        return
+
+                                    y_format = ".1%" if metric in {"承認率", "成約率"} else ",.0f"
+                                    tooltip_format = y_format
+
+                                    chart = (
+                                        alt.Chart(plot_df)
+                                        .mark_bar()
+                                        .encode(
+                                            x=alt.X(
+                                                "小項目:N",
+                                                sort=selected_smalls,
+                                                title="小項目",
+                                                axis=alt.Axis(labelAngle=0),
+                                            ),
+                                            xOffset=alt.XOffset(
+                                                f"{campaign_col}:N",
+                                                sort=selected_campaigns,
+                                            ),
+                                            y=alt.Y(
+                                                f"{metric}:Q",
+                                                title=metric,
+                                                axis=alt.Axis(format=y_format),
+                                                stack=None,
+                                            ),
+                                            color=alt.Color(
+                                                f"{campaign_col}:N",
+                                                sort=selected_campaigns,
+                                                title="キャンペーン",
+                                            ),
+                                            tooltip=[
+                                                alt.Tooltip("小項目:N", title="小項目"),
+                                                alt.Tooltip(f"{campaign_col}:N", title="キャンペーン"),
+                                                alt.Tooltip(f"{metric}:Q", title=metric, format=tooltip_format),
+                                            ],
+                                        )
+                                        .properties(height=360)
+                                    )
+                                    container.altair_chart(chart, width="stretch")
+
+                                chart_left, chart_right = st.columns(2)
+                                draw_grouped_mail_chart(chart_left, metric1)
+                                draw_grouped_mail_chart(chart_right, metric2)
+
+                                st.download_button(
+                                    "📥 メルマガ分析をダウンロード",
+                                    to_excel(mail_res),
+                                    "メルマガ分析_小項目別.xlsx",
+                                )
