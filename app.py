@@ -8,6 +8,33 @@ import streamlit as st
 st.set_page_config(page_title="後方数値データ分析", layout="wide")
 st.title("📊 後方数値データ分析ダッシュボード")
 
+st.markdown(
+    """
+    <style>
+    section[data-testid="stSidebar"] div[data-testid="stVerticalBlock"] {
+        gap: 0.55rem;
+    }
+    section[data-testid="stSidebar"] label p {
+        font-size: 0.88rem;
+        font-weight: 600;
+    }
+    div[data-baseweb="select"] > div {
+        min-height: 42px;
+    }
+    .stTabs [data-baseweb="tab-list"] {
+        gap: 0.4rem;
+        flex-wrap: wrap;
+    }
+    .stTabs [data-baseweb="tab"] {
+        height: 42px;
+        padding-left: 0.8rem;
+        padding-right: 0.8rem;
+    }
+    </style>
+    """,
+    unsafe_allow_html=True,
+)
+
 CORE_METRICS = [
     "申込件数", "承認件数", "成約件数", "承認率", "成約率",
     "コスト", "申込CPA", "承認CPA",
@@ -276,10 +303,22 @@ def metric_options(df: pd.DataFrame) -> list[str]:
 
 
 def selection_filter(df: pd.DataFrame, column: str, label: str, key: str) -> pd.DataFrame:
+    """候補が存在する分類列だけをサイドバーへ表示する。"""
     if column not in df.columns:
         return df
-    choices = sorted(df[column].dropna().astype(str).unique().tolist())
-    selected = st.sidebar.multiselect(label, choices, key=key)
+
+    values = df[column].dropna().astype(str).str.strip()
+    choices = sorted(v for v in values.unique().tolist() if v and v.casefold() != "nan")
+    if not choices:
+        st.sidebar.caption(f"{label}: 現在選択可能な値なし")
+        return df
+
+    selected = st.sidebar.multiselect(
+        label,
+        choices,
+        key=key,
+        placeholder="すべて",
+    )
     return df[df[column].astype(str).isin(selected)] if selected else df
 
 
@@ -452,12 +491,23 @@ with tab_media:
     default_groups = [c for c in ["大項目", "中項目", "小項目", "キャンペーン識別"] if c in dimension_cols]
     groups = st.multiselect("集計軸", dimension_cols, default=default_groups[:2], key="media_groups")
     default_metrics = [m for m in CORE_METRICS if m in all_metrics]
+    metric_actions = st.columns([1, 1, 6])
+    if metric_actions[0].button("全選択", key="media_select_all"):
+        st.session_state["media_metrics"] = all_metrics
+        st.rerun()
+    if metric_actions[1].button("基本項目", key="media_select_core"):
+        st.session_state["media_metrics"] = default_metrics
+        st.rerun()
     selected_metrics = st.multiselect("表示項目", all_metrics, default=default_metrics, key="media_metrics")
     res = aggregate(df, groups)
     res = add_extra_numeric_sums(df, res, groups, selected_metrics)
     display_cols = list(dict.fromkeys(groups + [m for m in selected_metrics if m in res.columns]))
-    st.dataframe(format_table(res[display_cols]), use_container_width=True, hide_index=True)
-    st.download_button("📥 媒体分析をダウンロード", to_excel(res[display_cols]), "媒体分析.xlsx")
+    if not display_cols:
+        st.info("集計軸または表示項目を1つ以上選択してください。")
+    else:
+        media_output = res[display_cols]
+        st.dataframe(format_table(media_output), use_container_width=True, hide_index=True)
+        st.download_button("📥 媒体分析をダウンロード", to_excel(media_output), "媒体分析.xlsx")
 
     if "申込日" in df.columns and groups:
         trend_group = st.selectbox("日次推移の系列", groups, key="media_trend_group")
@@ -499,8 +549,24 @@ with tab_cross:
         cross = aggregate(df, [x, y])
         st.dataframe(format_table(cross), use_container_width=True, hide_index=True)
         pivot = cross.pivot_table(index=x, columns=y, values=metric, aggfunc="sum")
-        st.subheader("ヒートマップ")
-        st.dataframe(pivot.style.background_gradient(cmap="Blues").format("{:.2f}" if metric in RATE_METRICS else "{:,.0f}"), use_container_width=True)
+
+        st.subheader("クロス集計表")
+        st.caption("matplotlibに依存しない表示です。行・列をクリックして並べ替えできます。")
+        if metric in {"承認率", "成約率"}:
+            pivot_display = pivot.map(lambda v: f"{v:.1%}" if pd.notna(v) else "-")
+        elif metric == "投下倍率":
+            pivot_display = pivot.map(lambda v: f"{v:.2f}" if pd.notna(v) else "-")
+        else:
+            pivot_display = pivot.map(lambda v: f"{v:,.0f}" if pd.notna(v) else "-")
+        st.dataframe(pivot_display, use_container_width=True)
+
+        st.subheader("上位組み合わせ")
+        sort_ascending = metric in {"申込CPA", "承認CPA"}
+        top_n = st.slider("表示件数", min_value=5, max_value=50, value=15, step=5, key="cross_top_n")
+        ranking_cols = [x, y, metric]
+        ranking = cross[ranking_cols].sort_values(metric, ascending=sort_ascending, na_position="last").head(top_n)
+        st.dataframe(format_table(ranking), use_container_width=True, hide_index=True)
+
         st.download_button("📥 クロス分析をダウンロード", to_excel(cross), "クロス分析.xlsx")
 
 with tab_seg:
