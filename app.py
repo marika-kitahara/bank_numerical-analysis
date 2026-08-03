@@ -49,8 +49,8 @@ st.markdown(
 # ======================
 # ブラウザ別設定保存
 # ======================
-PREFERENCE_STORAGE_KEY = "rear_numeric_analysis_preferences_v3"
-PREFERENCE_SCHEMA_VERSION = 3
+PREFERENCE_STORAGE_KEY = "rear_numeric_analysis_preferences_v4"
+PREFERENCE_SCHEMA_VERSION = 4
 PREFERENCE_KEYS = [
     "data_sheet", "master_sheet", "use_cost_sheet", "cost_sheet",
     "filter_date_range", "filter_big", "filter_middle", "filter_small",
@@ -85,6 +85,55 @@ ADMIN_DEFAULTS = {
 def admin_default(key, fallback=None):
     value = ADMIN_DEFAULTS.get(key, fallback)
     return list(value) if isinstance(value, list) else value
+
+
+
+
+def ensure_widget_default(key, default, options=None, multiple=False):
+    """ウィジェット生成前に管理者デフォルトを確実に反映する。
+
+    ブラウザ保存値は consume_saved_preference() が後から上書きする。
+    現在のセッションに古い値・候補外の値が残っている場合も安全に補正する。
+    """
+    valid = list(options) if options is not None else None
+
+    if multiple:
+        default_values = list(default or [])
+        if valid is not None:
+            default_values = [v for v in default_values if v in valid]
+
+        current = st.session_state.get(key)
+        if not isinstance(current, list):
+            st.session_state[key] = default_values
+        elif valid is not None:
+            cleaned = [v for v in current if v in valid]
+            st.session_state[key] = cleaned if cleaned else default_values
+        return
+
+    current = st.session_state.get(key)
+    if current is None or (valid is not None and current not in valid):
+        if valid is None:
+            st.session_state[key] = default
+        elif default in valid:
+            st.session_state[key] = default
+        elif valid:
+            st.session_state[key] = valid[0]
+
+
+def initialize_restored_defaults_once():
+    """今回指定された管理者デフォルトを、古いセッション状態より優先して一度だけ復元する。"""
+    marker = "_restored_admin_defaults_v4"
+    if st.session_state.get(marker):
+        return
+
+    for key in [
+        "media_groups", "media_trend_group", "win_pattern_cols",
+        "alloc_amount", "cross_x", "cross_y", "seg_col",
+        "mail_metrics", "mail_metric1", "mail_metric2",
+    ]:
+        st.session_state.pop(key, None)
+
+    st.session_state[marker] = True
 
 
 def serializable_value(value):
@@ -229,6 +278,7 @@ def collect_preferences():
 
 local_storage = LocalStorage() if LocalStorage is not None else None
 load_browser_preferences(local_storage)
+initialize_restored_defaults_once()
 
 
 CORE_METRICS = [
@@ -744,9 +794,11 @@ tab_media, tab_win, tab_cross, tab_seg, tab_mail = st.tabs([
 
 with tab_media:
     st.subheader("媒体分析")
-    default_groups = [c for c in ["大項目", "中項目", "小項目", "キャンペーン識別"] if c in dimension_cols]
-    consume_saved_preference("media_groups", dimension_cols, default=[c for c in admin_default("media_groups", default_groups[:3]) if c in dimension_cols], multiple=True)
-    groups = st.multiselect("集計軸", dimension_cols, default=[c for c in admin_default("media_groups", default_groups[:3]) if c in dimension_cols], key="media_groups")
+    default_groups = [c for c in ["大項目", "中項目", "小項目"] if c in dimension_cols]
+    media_group_defaults = [c for c in admin_default("media_groups", default_groups) if c in dimension_cols]
+    ensure_widget_default("media_groups", media_group_defaults, dimension_cols, multiple=True)
+    consume_saved_preference("media_groups", dimension_cols, default=media_group_defaults, multiple=True)
+    groups = st.multiselect("集計軸", dimension_cols, default=media_group_defaults, key="media_groups")
     default_metrics = [m for m in CORE_METRICS if m in all_metrics]
     metric_actions = st.columns([1, 1, 6])
     if metric_actions[0].button("全選択", key="media_select_all"):
@@ -768,16 +820,31 @@ with tab_media:
         st.download_button("📥 媒体分析をダウンロード", to_excel(media_output), "媒体分析.xlsx")
 
     if "申込日" in df.columns and groups:
-        default_trend_group = admin_default("media_trend_group", "中項目") if admin_default("media_trend_group", "中項目") in groups else groups[0]
-        trend_metric_options = [m for m in selected_metrics if m in CORE_METRICS] or ["申込件数"]
+        default_trend_group = "中項目" if "中項目" in groups else groups[0]
+        trend_metric_options = [m for m in selected_metrics if m in CORE_METRICS]
+        if "申込件数" not in trend_metric_options:
+            trend_metric_options = ["申込件数"] + trend_metric_options
+
+        ensure_widget_default("media_trend_group", default_trend_group, groups)
+        ensure_widget_default("media_trend_metric", "申込件数", trend_metric_options)
         consume_saved_preference("media_trend_group", groups, default=default_trend_group)
-        consume_saved_preference("media_trend_metric", trend_metric_options, default=trend_metric_options[0])
+        consume_saved_preference("media_trend_metric", trend_metric_options, default="申込件数")
+
         trend_group = st.selectbox("日次推移の系列", groups, key="media_trend_group")
         trend_metric = st.selectbox("日次推移の指標", trend_metric_options, key="media_trend_metric")
-        daily_df = df.copy(); daily_df["日付"] = daily_df["申込日"].dt.date
+
+        daily_df = df.loc[df["申込日"].notna()].copy()
+        daily_df["日付"] = daily_df["申込日"].dt.normalize()
         daily = aggregate(daily_df, ["日付", trend_group])
-        pivot = daily.pivot_table(index="日付", columns=trend_group, values=trend_metric, aggfunc="sum")
-        st.line_chart(pivot)
+        pivot = (
+            daily.pivot_table(index="日付", columns=trend_group, values=trend_metric, aggfunc="sum")
+            .sort_index()
+            .dropna(axis=1, how="all")
+        )
+        if pivot.empty:
+            st.info("日次推移を表示できるデータがありません。")
+        else:
+            st.line_chart(pivot, width="stretch")
 
 with tab_win:
     st.subheader("勝ちパターン分析")
@@ -815,6 +882,9 @@ with tab_cross:
     default_cross_x = admin_default("cross_x", "年齢グループ") if admin_default("cross_x", "年齢グループ") in dimension_cols else dimension_cols[0]
     default_cross_y = admin_default("cross_y", "利用目的") if admin_default("cross_y", "利用目的") in dimension_cols else dimension_cols[min(1, len(dimension_cols)-1)]
     cross_metric_options = [m for m in CORE_METRICS if m in all_metrics]
+    ensure_widget_default("cross_x", default_cross_x, dimension_cols)
+    ensure_widget_default("cross_y", default_cross_y, dimension_cols)
+    ensure_widget_default("cross_metric", cross_metric_options[0], cross_metric_options)
     consume_saved_preference("cross_x", dimension_cols, default=default_cross_x)
     consume_saved_preference("cross_y", dimension_cols, default=default_cross_y)
     consume_saved_preference("cross_metric", cross_metric_options, default=cross_metric_options[0])
@@ -850,6 +920,8 @@ with tab_seg:
     st.subheader("セグメント別分析")
     default_seg = admin_default("seg_col", "小項目") if admin_default("seg_col", "小項目") in dimension_cols else dimension_cols[0]
     seg_metric_options = [m for m in CORE_METRICS if m in all_metrics]
+    ensure_widget_default("seg_col", default_seg, dimension_cols)
+    ensure_widget_default("seg_metric", seg_metric_options[0], seg_metric_options)
     consume_saved_preference("seg_col", dimension_cols, default=default_seg)
     consume_saved_preference("seg_metric", seg_metric_options, default=seg_metric_options[0])
     seg = st.selectbox("分析項目", dimension_cols, key="seg_col")
