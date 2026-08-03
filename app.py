@@ -1336,7 +1336,7 @@ st.sidebar.subheader("⚙️ 個人設定")
 if LocalStorage is None:
     st.sidebar.warning("ブラウザ保存機能を使うには requirements.txt に streamlit-local-storage を追加してください。")
 else:
-    st.sidebar.caption("コード側のデフォルトを維持し、保存した項目だけこのブラウザで復元します。IPアドレスが変わっても有効です。")
+    st.sidebar.caption("コード側のデフォルトを維持し、保存した項目だけこのブラウザで復元します。")
     if st.sidebar.button("💾 現在の設定を保存", width="stretch", key="save_browser_preferences"):
         payload = json.dumps({"schema_version": PREFERENCE_SCHEMA_VERSION, "values": collect_preferences()}, ensure_ascii=False)
         storage_set_item(local_storage, PREFERENCE_STORAGE_KEY, payload, component_key="save_preferences_component")
