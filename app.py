@@ -331,16 +331,28 @@ def make_unique_columns(df: pd.DataFrame) -> pd.DataFrame:
     return df
 
 
-@st.cache_data(show_spinner=False)
-def get_sheet_names(file_bytes: bytes) -> list[str]:
-    return pd.ExcelFile(BytesIO(file_bytes), engine="openpyxl").sheet_names
+REQUIRED_SHEETS = [
+    "後方数値データ(加工版)",
+    "媒体コードマスタver3",
+    "コストデータ",
+]
 
 
-@st.cache_data(show_spinner="Excelを読み込んでいます…")
-def read_sheet(file_bytes: bytes, sheet_name: str) -> pd.DataFrame:
-    return make_unique_columns(clean_columns(pd.read_excel(
-        BytesIO(file_bytes), sheet_name=sheet_name, engine="openpyxl"
-    )))
+@st.cache_data(show_spinner="必要な3シートを読み込んでいます…")
+def read_required_sheets(file_bytes: bytes) -> dict[str, pd.DataFrame]:
+    """規定の3シートだけを1回のExcel読み込みで取得する。
+
+    追加シートが存在しても分析対象にはせず、読み込み対象を固定する。
+    """
+    book = pd.read_excel(
+        BytesIO(file_bytes),
+        sheet_name=REQUIRED_SHEETS,
+        engine="openpyxl",
+    )
+    return {
+        sheet_name: make_unique_columns(clean_columns(df))
+        for sheet_name, df in book.items()
+    }
 
 
 def safe_div(numerator, denominator):
@@ -716,34 +728,38 @@ def allocation_simulator(df: pd.DataFrame):
             st.warning(f"元媒体の実績コストを超えるため、試算上は {effective_amount:,.0f}円で計算しました。")
 
 
-uploaded_file = st.file_uploader("後方数値データ・媒体コードマスタ・コストデータを含むExcel", type=["xlsx"])
+uploaded_file = st.file_uploader(
+    "後方数値データ・媒体コードマスタ・コストデータを含むExcel",
+    type=["xlsx"],
+)
 
 if uploaded_file is None:
-    st.info("Excelファイルをアップロードすると、シート選択が表示されます。")
+    st.info(
+        "Excelファイルをアップロードしてください。"
+        "追加シートが含まれていても、規定の3シートだけを読み込みます。"
+    )
     st.stop()
 
 file_bytes = uploaded_file.getvalue()
-sheets = get_sheet_names(file_bytes)
-
-st.sidebar.header("📄 読み込み設定")
-def_index = next((i for i, s in enumerate(sheets) if "後方" in s), 0)
-master_index = next((i for i, s in enumerate(sheets) if "媒体コード" in s or "マスタ" in s), min(1, len(sheets)-1))
-cost_index = next((i for i, s in enumerate(sheets) if "コスト" in s), 0)
-
-consume_saved_preference("data_sheet", sheets, default=sheets[def_index])
-consume_saved_preference("master_sheet", sheets, default=sheets[master_index])
-consume_saved_preference("use_cost_sheet", default=True)
-consume_saved_preference("cost_sheet", sheets, default=sheets[cost_index])
-data_sheet = st.sidebar.selectbox("後方数値データのシート", sheets, index=def_index, key="data_sheet")
-master_sheet = st.sidebar.selectbox("媒体コードマスタのシート", sheets, index=master_index, key="master_sheet")
-use_cost_sheet = st.sidebar.checkbox("コストデータシートでエラーを補完", value=True, key="use_cost_sheet")
-cost_sheet = st.sidebar.selectbox("コストデータのシート", sheets, index=cost_index, disabled=not use_cost_sheet, key="cost_sheet")
 
 try:
-    raw_df = read_sheet(file_bytes, data_sheet)
-    master_df = read_sheet(file_bytes, master_sheet)
-    cost_df = read_sheet(file_bytes, cost_sheet) if use_cost_sheet else None
+    loaded_sheets = read_required_sheets(file_bytes)
+    raw_df = loaded_sheets["後方数値データ(加工版)"]
+    master_df = loaded_sheets["媒体コードマスタver3"]
+    cost_df = loaded_sheets["コストデータ"]
     base_df = preprocess(raw_df, master_df, cost_df)
+except ValueError as exc:
+    # pandas/openpyxlが規定シート不足を検知した場合に、利用者へ分かりやすく案内する。
+    message = str(exc)
+    if "Worksheet named" in message:
+        st.error(
+            "規定シートが見つかりません。"
+            "Excel内に次の3シートが存在することを確認してください："
+            "「後方数値データ(加工版)」「媒体コードマスタver3」「コストデータ」"
+        )
+    else:
+        st.error(f"読み込み・前処理でエラーが発生しました: {exc}")
+    st.stop()
 except Exception as exc:
     st.error(f"読み込み・前処理でエラーが発生しました: {exc}")
     st.stop()
@@ -1351,4 +1367,3 @@ else:
         st.session_state["_browser_preferences_loaded"] = True
         time.sleep(0.8)
         st.rerun()
-
