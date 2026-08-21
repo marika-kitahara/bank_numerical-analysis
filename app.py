@@ -1,13 +1,15 @@
 import json
 import re
 import time
+import os
+import tempfile
+import hashlib
 from io import BytesIO
 
 import numpy as np
 import altair as alt
 import pandas as pd
 import streamlit as st
-from openpyxl import load_workbook
 
 try:
     from streamlit_local_storage import LocalStorage
@@ -536,11 +538,34 @@ def format_table(df: pd.DataFrame):
     return df.style.format(formats, na_rep="-")
 
 
-def to_excel(df: pd.DataFrame) -> bytes:
+@st.cache_data(show_spinner=False)
+def to_excel_cached(df: pd.DataFrame) -> bytes:
+    """分析結果のExcelは、ユーザーが作成を要求した時だけ生成する。"""
     output = BytesIO()
     with pd.ExcelWriter(output, engine="openpyxl") as writer:
         df.to_excel(writer, index=False, sheet_name="分析結果")
     return output.getvalue()
+
+
+def lazy_excel_download(df: pd.DataFrame, *, label: str, file_name: str, key: str) -> None:
+    """画面描画のたびにExcelを作らず、作成ボタン押下時だけ生成する。"""
+    state_key = f"_excel_export_{key}"
+    if st.button(f"🛠️ {label}を作成", key=f"{key}_create"):
+        try:
+            with st.spinner(f"{label}を作成しています…"):
+                st.session_state[state_key] = to_excel_cached(df)
+            st.success("作成できました。")
+        except Exception as exc:
+            st.session_state.pop(state_key, None)
+            st.error(f"{label}の作成に失敗しました: {exc}")
+    if state_key in st.session_state:
+        st.download_button(
+            f"📥 {label}をダウンロード",
+            data=st.session_state[state_key],
+            file_name=file_name,
+            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+            key=f"{key}_download",
+        )
 
 
 def _excel_month_key(value) -> str | None:
@@ -609,11 +634,11 @@ def build_ak_results(raw_df: pd.DataFrame, cost_df: pd.DataFrame) -> list[float 
     ]
 
 
-def patch_ak_in_original_xlsx(file_bytes: bytes, ak_results: list[float | None]) -> bytes:
-    """元xlsxのZIP構造をそのまま使い、対象シートXMLのAKセルだけ差し替える。
+def patch_ak_in_original_xlsx(file_bytes: bytes, ak_results: list[float | None]) -> str:
+    """元xlsxを再構築せず、AKセルだけ差し替えた一時ファイルを作る。
 
-    全セルをopenpyxlで書き直さないため、60MB級ファイルでも処理時間とメモリを大幅に抑える。
-    他セル・書式・他シートは元ファイルをそのまま保持する。
+    60MB級ファイル対策として、完成ファイル本体をsession_stateのbytesで保持しない。
+    戻り値は一時xlsxのパス。
     """
     import posixpath
     import re as _re
@@ -621,96 +646,86 @@ def patch_ak_in_original_xlsx(file_bytes: bytes, ak_results: list[float | None])
     from xml.etree import ElementTree as ET
 
     src = BytesIO(file_bytes)
-    out = BytesIO()
+    tmp = tempfile.NamedTemporaryFile(prefix="rear_numeric_ak_", suffix=".xlsx", delete=False)
+    tmp_path = tmp.name
+    tmp.close()
 
-    with zipfile.ZipFile(src, "r") as zin:
-        # workbook.xml から対象シートの relationship id を取得。
-        wb_root = ET.fromstring(zin.read("xl/workbook.xml"))
-        ns = {
-            "main": "http://schemas.openxmlformats.org/spreadsheetml/2006/main",
-            "r": "http://schemas.openxmlformats.org/officeDocument/2006/relationships",
-        }
-        rel_id = None
-        for sheet in wb_root.findall("main:sheets/main:sheet", ns):
-            if sheet.attrib.get("name") == "後方数値データ(加工版)":
-                rel_id = sheet.attrib.get("{http://schemas.openxmlformats.org/officeDocument/2006/relationships}id")
-                break
-        if not rel_id:
-            raise ValueError("『後方数値データ(加工版)』シートが見つかりません。")
+    try:
+        with zipfile.ZipFile(src, "r") as zin:
+            wb_root = ET.fromstring(zin.read("xl/workbook.xml"))
+            ns = {
+                "main": "http://schemas.openxmlformats.org/spreadsheetml/2006/main",
+                "r": "http://schemas.openxmlformats.org/officeDocument/2006/relationships",
+            }
+            rel_id = None
+            for sheet in wb_root.findall("main:sheets/main:sheet", ns):
+                if sheet.attrib.get("name") == "後方数値データ(加工版)":
+                    rel_id = sheet.attrib.get("{http://schemas.openxmlformats.org/officeDocument/2006/relationships}id")
+                    break
+            if not rel_id:
+                raise ValueError("『後方数値データ(加工版)』シートが見つかりません。")
 
-        rel_root = ET.fromstring(zin.read("xl/_rels/workbook.xml.rels"))
-        target = None
-        for rel in rel_root:
-            if rel.attrib.get("Id") == rel_id:
-                target = rel.attrib.get("Target")
-                break
-        if not target:
-            raise ValueError("対象シートの内部XMLを特定できません。")
+            rel_root = ET.fromstring(zin.read("xl/_rels/workbook.xml.rels"))
+            target = None
+            for rel in rel_root:
+                if rel.attrib.get("Id") == rel_id:
+                    target = rel.attrib.get("Target")
+                    break
+            if not target:
+                raise ValueError("対象シートの内部XMLを特定できません。")
 
-        if target.startswith("/"):
-            sheet_path = target.lstrip("/")
-        else:
-            sheet_path = posixpath.normpath(posixpath.join("xl", target))
+            sheet_path = target.lstrip("/") if target.startswith("/") else posixpath.normpath(posixpath.join("xl", target))
+            sheet_xml = zin.read(sheet_path)
+            result_by_row = {i + 2: v for i, v in enumerate(ak_results)}
 
-        # AKセルは既存セルの属性（style等）を残したまま値だけ差し替える。
-        # 元データの1行目はヘッダーなので、DataFrame index 0 -> Excel row 2。
-        sheet_xml = zin.read(sheet_path)
-        result_by_row = {i + 2: v for i, v in enumerate(ak_results)}
+            cell_pat = _re.compile(rb'<c(?P<attrs>[^>]*\br="AK(?P<row>\d+)"[^>]*)>(?P<body>.*?)</c>', _re.DOTALL)
+            seen_rows = set()
 
-        cell_pat = _re.compile(
-            rb'<c(?P<attrs>[^>]*\br="AK(?P<row>\d+)"[^>]*)>(?P<body>.*?)</c>',
-            _re.DOTALL,
-        )
-        seen_rows = set()
-
-        def replace_cell(match):
-            row = int(match.group("row"))
-            if row not in result_by_row:
-                return match.group(0)
-            seen_rows.add(row)
-            attrs = match.group("attrs")
-            # inlineStr / shared-string等の型指定は数値と両立しないため除去。
-            attrs = _re.sub(rb'\s+t="[^"]*"', b'', attrs)
-            value = result_by_row[row]
-            if value is None or pd.isna(value):
-                return b'<c' + attrs + b'></c>'
-            value_text = format(float(value), ".15g").encode("ascii")
-            return b'<c' + attrs + b'><v>' + value_text + b'</v></c>'
-
-        patched = cell_pat.sub(replace_cell, sheet_xml)
-
-        # AKセル自体が存在しない行があれば、その行XMLの末尾へ追加する。
-        missing = set(result_by_row) - seen_rows
-        if missing:
-            row_pat = _re.compile(rb'<row(?P<attrs>[^>]*\br="(?P<row>\d+)"[^>]*)>(?P<body>.*?)</row>', _re.DOTALL)
-
-            def add_missing_cell(match):
+            def replace_cell(match):
                 row = int(match.group("row"))
-                if row not in missing:
+                if row not in result_by_row:
                     return match.group(0)
+                seen_rows.add(row)
+                attrs = _re.sub(rb'\s+t="[^"]*"', b'', match.group("attrs"))
                 value = result_by_row[row]
                 if value is None or pd.isna(value):
-                    cell = f'<c r="AK{row}"></c>'.encode("ascii")
-                else:
-                    value_text = format(float(value), ".15g")
-                    cell = f'<c r="AK{row}"><v>{value_text}</v></c>'.encode("ascii")
-                return b'<row' + match.group("attrs") + b'>' + match.group("body") + cell + b'</row>'
+                    return b'<c' + attrs + b'></c>'
+                value_text = format(float(value), ".15g").encode("ascii")
+                return b'<c' + attrs + b'><v>' + value_text + b'</v></c>'
 
-            patched = row_pat.sub(add_missing_cell, patched)
+            patched = cell_pat.sub(replace_cell, sheet_xml)
+            missing = set(result_by_row) - seen_rows
+            if missing:
+                row_pat = _re.compile(rb'<row(?P<attrs>[^>]*\br="(?P<row>\d+)"[^>]*)>(?P<body>.*?)</row>', _re.DOTALL)
+                def add_missing_cell(match):
+                    row = int(match.group("row"))
+                    if row not in missing:
+                        return match.group(0)
+                    value = result_by_row[row]
+                    if value is None or pd.isna(value):
+                        cell = f'<c r="AK{row}"></c>'.encode("ascii")
+                    else:
+                        value_text = format(float(value), ".15g")
+                        cell = f'<c r="AK{row}"><v>{value_text}</v></c>'.encode("ascii")
+                    return b'<row' + match.group("attrs") + b'>' + match.group("body") + cell + b'</row>'
+                patched = row_pat.sub(add_missing_cell, patched)
 
-        # それ以外のZIPエントリはコピー。対象sheet XMLだけ置換。
-        with zipfile.ZipFile(out, "w", compression=zipfile.ZIP_DEFLATED, compresslevel=1) as zout:
-            for item in zin.infolist():
-                data = patched if item.filename == sheet_path else zin.read(item.filename)
-                # ZipInfoをそのまま使うと元の圧縮設定が引き継がれるので、新規Infoで軽圧縮。
-                info = zipfile.ZipInfo(item.filename, date_time=item.date_time)
-                info.compress_type = zipfile.ZIP_DEFLATED
-                info.external_attr = item.external_attr
-                info.create_system = item.create_system
-                info.flag_bits = item.flag_bits
-                zout.writestr(info, data, compress_type=zipfile.ZIP_DEFLATED, compresslevel=1)
-
-    return out.getvalue()
+            with zipfile.ZipFile(tmp_path, "w", compression=zipfile.ZIP_DEFLATED, compresslevel=1) as zout:
+                for item in zin.infolist():
+                    data = patched if item.filename == sheet_path else zin.read(item.filename)
+                    info = zipfile.ZipInfo(item.filename, date_time=item.date_time)
+                    info.compress_type = zipfile.ZIP_DEFLATED
+                    info.external_attr = item.external_attr
+                    info.create_system = item.create_system
+                    info.flag_bits = item.flag_bits
+                    zout.writestr(info, data, compress_type=zipfile.ZIP_DEFLATED, compresslevel=1)
+        return tmp_path
+    except Exception:
+        try:
+            os.remove(tmp_path)
+        except OSError:
+            pass
+        raise
 
 
 def metric_options(df: pd.DataFrame) -> list[str]:
@@ -913,6 +928,17 @@ if uploaded_file is None:
 
 file_bytes = uploaded_file.getvalue()
 
+# 別ファイルへ差し替えたら、前ファイル用の一時出力を破棄する。
+file_token = hashlib.sha1(file_bytes[:1024 * 1024] + str(len(file_bytes)).encode()).hexdigest()
+if st.session_state.get("_uploaded_file_token") != file_token:
+    old_path = st.session_state.pop("ak_export_path", None)
+    if old_path:
+        try:
+            os.remove(old_path)
+        except OSError:
+            pass
+    st.session_state["_uploaded_file_token"] = file_token
+
 try:
     loaded_sheets = read_required_sheets(file_bytes)
     raw_df = loaded_sheets["後方数値データ(加工版)"]
@@ -971,22 +997,30 @@ st.caption("AKは各行のB年月・AF・L・Mを使って計算します。60MB
 
 if st.button("🛠️ AK列計算済みExcelを作成", key="create_ak_export"):
     try:
+        old_path = st.session_state.pop("ak_export_path", None)
+        if old_path:
+            try:
+                os.remove(old_path)
+            except OSError:
+                pass
         with st.spinner("AK列を計算し、元ExcelのAKだけ差し替えています…"):
             ak_results = build_ak_results(raw_df, cost_df)
-            st.session_state["ak_export_bytes"] = patch_ak_in_original_xlsx(file_bytes, ak_results)
+            st.session_state["ak_export_path"] = patch_ak_in_original_xlsx(file_bytes, ak_results)
         st.success("作成できました。下のボタンからダウンロードできます。")
     except Exception as exc:
-        st.session_state.pop("ak_export_bytes", None)
+        st.session_state.pop("ak_export_path", None)
         st.error(f"AK列計算済みExcelの作成に失敗しました: {exc}")
 
-if "ak_export_bytes" in st.session_state:
-    st.download_button(
-        "📥 AK列計算済みの後方数値データをダウンロード",
-        st.session_state["ak_export_bytes"],
-        "後方数値データ_AK計算済み.xlsx",
-        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-        key="download_ak_export",
-    )
+ak_export_path = st.session_state.get("ak_export_path")
+if ak_export_path and os.path.exists(ak_export_path):
+    with open(ak_export_path, "rb") as export_file:
+        st.download_button(
+            "📥 AK列計算済みの後方数値データをダウンロード",
+            data=export_file,
+            file_name="後方数値データ_AK計算済み.xlsx",
+            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+            key="download_ak_export",
+        )
 
 # 分析軸候補：日付・識別・属性列。内部計算列は除外
 internal_cols = {"申込フラグ", "承認フラグ", "成約フラグ", "コスト_元データ", "コスト補完フラグ", "媒体月申込件数", "補完元コスト"}
@@ -1010,7 +1044,7 @@ with tab_media:
     media_group_defaults = [c for c in admin_default("media_groups", default_groups) if c in dimension_cols]
     ensure_widget_default("media_groups", media_group_defaults, dimension_cols, multiple=True)
     consume_saved_preference("media_groups", dimension_cols, default=media_group_defaults, multiple=True)
-    groups = st.multiselect("集計軸", dimension_cols, default=media_group_defaults, key="media_groups")
+    groups = st.multiselect("集計軸", dimension_cols, key="media_groups")
     default_metrics = [m for m in CORE_METRICS if m in all_metrics]
     metric_actions = st.columns([1, 1, 6])
     if metric_actions[0].button("全選択", key="media_select_all"):
@@ -1020,7 +1054,7 @@ with tab_media:
         st.session_state["media_metrics"] = default_metrics
         st.rerun()
     consume_saved_preference("media_metrics", all_metrics, default=default_metrics, multiple=True)
-    selected_metrics = st.multiselect("表示項目", all_metrics, default=default_metrics, key="media_metrics")
+    selected_metrics = st.multiselect("表示項目", all_metrics, key="media_metrics")
     res = aggregate(df, groups)
     res = add_extra_numeric_sums(df, res, groups, selected_metrics)
     display_cols = list(dict.fromkeys(groups + [m for m in selected_metrics if m in res.columns]))
@@ -1029,7 +1063,7 @@ with tab_media:
     else:
         media_output = res[display_cols]
         st.dataframe(format_table(media_output), width="stretch", hide_index=True)
-        st.download_button("📥 媒体分析をダウンロード", to_excel(media_output), "媒体分析.xlsx")
+        lazy_excel_download(media_output, label="媒体分析Excel", file_name="媒体分析.xlsx", key="media_export")
 
     if "申込日" in df.columns and groups:
         default_trend_group = "中項目" if "中項目" in groups else groups[0]
@@ -1069,7 +1103,7 @@ with tab_win:
     pattern_options = [c for c in ["小項目", "媒体名", "キャンペーン識別", "年齢グループ", "年収グループ", "性別", "利用目的", "都道府県"] if c in dimension_cols]
     pattern_defaults = [c for c in admin_default("win_pattern_cols", ["小項目", "利用目的", "年齢グループ"]) if c in pattern_options]
     consume_saved_preference("win_pattern_cols", pattern_options, default=pattern_defaults, multiple=True)
-    pattern_cols = st.multiselect("勝ちパターンの組み合わせ", pattern_options, default=pattern_defaults, key="win_pattern_cols")
+    pattern_cols = st.multiselect("勝ちパターンの組み合わせ", pattern_options, key="win_pattern_cols")
     win_metric_options = ["承認率", "申込件数", "投下倍率", "取扱金額_翌月", "申込CPA", "承認CPA", "成約件数", "成約率"]
     consume_saved_preference("win_target_metric", win_metric_options, default=admin_default("win_target_metric", "承認率"))
     consume_saved_preference("win_min_count", default=admin_default("win_min_count", 30))
@@ -1086,7 +1120,7 @@ with tab_win:
             combo = " × ".join(str(top[c]) for c in pattern_cols)
             direction = "最小" if ascending else "最大"
             st.success(f"{target_metric}が{direction}の勝ちパターン：{combo}")
-        st.download_button("📥 勝ちパターンをダウンロード", to_excel(win), "勝ちパターン.xlsx")
+        lazy_excel_download(win, label="勝ちパターンExcel", file_name="勝ちパターン.xlsx", key="win_export")
     allocation_simulator(win_df)
 
 with tab_cross:
@@ -1126,7 +1160,7 @@ with tab_cross:
         ranking = cross[ranking_cols].sort_values(metric, ascending=sort_ascending, na_position="last").head(top_n)
         st.dataframe(format_table(ranking), width="stretch", hide_index=True)
 
-        st.download_button("📥 クロス分析をダウンロード", to_excel(cross), "クロス分析.xlsx")
+        lazy_excel_download(cross, label="クロス分析Excel", file_name="クロス分析.xlsx", key="cross_export")
 
 with tab_seg:
     st.subheader("セグメント別分析")
@@ -1153,7 +1187,7 @@ with tab_seg:
     chart_df = seg_res[seg_res[seg].isin(selected_values)].set_index(seg)[[chart_metric]]
     st.bar_chart(chart_df)
     st.dataframe(format_table(seg_res), width="stretch", hide_index=True)
-    st.download_button("📥 セグメント分析をダウンロード", to_excel(seg_res), "セグメント分析.xlsx")
+    lazy_excel_download(seg_res, label="セグメント分析Excel", file_name="セグメント分析.xlsx", key="segment_export")
 
 with tab_mail:
     st.subheader("メルマガ分析（中項目 = Mail）")
@@ -1364,10 +1398,11 @@ with tab_mail:
                                 draw_grouped_mail_chart(chart_left, metric1)
                                 draw_grouped_mail_chart(chart_right, metric2)
 
-                                st.download_button(
-                                    "📥 メルマガ分析をダウンロード",
-                                    to_excel(mail_res),
-                                    "メルマガ分析_小項目別.xlsx",
+                                lazy_excel_download(
+                                    mail_res,
+                                    label="メルマガ分析Excel",
+                                    file_name="メルマガ分析_小項目別.xlsx",
+                                    key="mail_export",
                                 )
 
                                 # ======================
@@ -1534,10 +1569,11 @@ with tab_mail:
                                                 width="stretch",
                                             )
 
-                                        st.download_button(
-                                            "📥 メルマガのセグメント分析をダウンロード",
-                                            to_excel(mail_segment_res),
-                                            "メルマガ分析_セグメント別.xlsx",
+                                        lazy_excel_download(
+                                            mail_segment_res,
+                                            label="メルマガのセグメント分析Excel",
+                                            file_name="メルマガ分析_セグメント別.xlsx",
+                                            key="mail_segment_export",
                                         )
 
 # ======================
