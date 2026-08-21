@@ -3,16 +3,15 @@ import re
 import time
 import os
 import tempfile
-import hashlib
-import shutil
 from io import BytesIO
 
 import numpy as np
 import altair as alt
 import pandas as pd
 import streamlit as st
+from openpyxl import load_workbook
 
-LocalStorage = None  # 起動安定化のためブラウザ保存機能を停止
+LocalStorage = None  # 起動安定化のためブラウザ保存機能を一時停止
 
 st.set_page_config(page_title="後方数値データ分析", layout="wide")
 st.title("📊 後方数値データ分析ダッシュボード")
@@ -536,35 +535,11 @@ def format_table(df: pd.DataFrame):
     return df.style.format(formats, na_rep="-")
 
 
-@st.cache_data(show_spinner=False)
-def to_excel_cached(df: pd.DataFrame) -> bytes:
-    """分析結果Excelは作成ボタンを押した時だけ生成する。"""
+def to_excel(df: pd.DataFrame) -> bytes:
     output = BytesIO()
     with pd.ExcelWriter(output, engine="openpyxl") as writer:
         df.to_excel(writer, index=False, sheet_name="分析結果")
     return output.getvalue()
-
-
-def lazy_excel_download(df: pd.DataFrame, *, label: str, file_name: str, key: str) -> None:
-    state_key = f"_excel_export_{key}"
-
-    if st.button(f"🛠️ {label}を作成", key=f"{key}_create"):
-        try:
-            with st.spinner(f"{label}を作成しています…"):
-                st.session_state[state_key] = to_excel_cached(df)
-            st.success("作成できました。")
-        except Exception as exc:
-            st.session_state.pop(state_key, None)
-            st.error(f"{label}の作成に失敗しました: {exc}")
-
-    if state_key in st.session_state:
-        st.download_button(
-            f"📥 {label}をダウンロード",
-            data=st.session_state[state_key],
-            file_name=file_name,
-            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-            key=f"{key}_download",
-        )
 
 
 def _excel_month_key(value) -> str | None:
@@ -633,19 +608,20 @@ def build_ak_results(raw_df: pd.DataFrame, cost_df: pd.DataFrame) -> list[float 
     ]
 
 
-def patch_ak_in_original_xlsx(file_bytes: bytes, ak_results: list[float | None]) -> str:
-    """元xlsxのAKだけ差し替え、一時ファイルへ保存する省メモリ版。
+def create_ak_one_sheet_xlsx(
+    raw_df: pd.DataFrame,
+    ak_results: list[float | None],
+) -> str:
+    """後方数値データ(加工版)だけを省メモリで新規xlsxへ書き出す。
 
-    ・完成xlsxをBytesIO/session_stateへ保持しない
-    ・対象外ZIPエントリはストリームコピー
-    ・対象シートXMLだけを処理する
+    元ブックの他シートは一切コピーしない。
+    openpyxlのwrite_onlyモードで、60MB級入力でも出力時のメモリ増加を抑える。
     """
-    import posixpath
-    import re as _re
-    import zipfile
-    from xml.etree import ElementTree as ET
+    from openpyxl import Workbook
 
-    src = BytesIO(file_bytes)
+    if len(raw_df) != len(ak_results):
+        raise ValueError("AK計算結果と後方数値データの行数が一致しません。")
+
     tmp = tempfile.NamedTemporaryFile(
         prefix="rear_numeric_ak_",
         suffix=".xlsx",
@@ -655,132 +631,46 @@ def patch_ak_in_original_xlsx(file_bytes: bytes, ak_results: list[float | None])
     tmp.close()
 
     try:
-        with zipfile.ZipFile(src, "r") as zin:
-            wb_root = ET.fromstring(zin.read("xl/workbook.xml"))
-            ns = {
-                "main": "http://schemas.openxmlformats.org/spreadsheetml/2006/main",
-                "r": "http://schemas.openxmlformats.org/officeDocument/2006/relationships",
-            }
+        wb = Workbook(write_only=True)
+        ws = wb.create_sheet(title="後方数値データ(加工版)")
 
-            rel_id = None
-            for sheet in wb_root.findall("main:sheets/main:sheet", ns):
-                if sheet.attrib.get("name") == "後方数値データ(加工版)":
-                    rel_id = sheet.attrib.get(
-                        "{http://schemas.openxmlformats.org/officeDocument/2006/relationships}id"
-                    )
-                    break
-            if not rel_id:
-                raise ValueError("『後方数値データ(加工版)』シートが見つかりません。")
+        # ヘッダー
+        headers = [str(c) for c in raw_df.columns]
 
-            rel_root = ET.fromstring(zin.read("xl/_rels/workbook.xml.rels"))
-            target = None
-            for rel in rel_root:
-                if rel.attrib.get("Id") == rel_id:
-                    target = rel.attrib.get("Target")
-                    break
-            if not target:
-                raise ValueError("対象シートの内部XMLを特定できません。")
+        # AK列はExcel上の37列目。既存列数が足りない場合もAKまで補う。
+        while len(headers) < 37:
+            headers.append("")
+        headers[36] = "コスト"
+        ws.append(headers)
 
-            if target.startswith("/"):
-                sheet_path = target.lstrip("/")
-            else:
-                sheet_path = posixpath.normpath(posixpath.join("xl", target))
+        # DataFrameを丸ごと別コピーせず、1行ずつ出力する。
+        for row_values, ak_value in zip(
+            raw_df.itertuples(index=False, name=None),
+            ak_results,
+        ):
+            row = list(row_values)
 
-            # 対象シートだけ読み込む。
-            sheet_xml = zin.read(sheet_path)
-            result_by_row = {i + 2: v for i, v in enumerate(ak_results)}
+            while len(row) < 37:
+                row.append(None)
 
-            cell_pat = _re.compile(
-                rb'<c(?P<attrs>[^>]*\br="AK(?P<row>\d+)"[^>]*)>(?P<body>.*?)</c>',
-                _re.DOTALL,
-            )
-            seen_rows = set()
+            row[36] = None if ak_value is None or pd.isna(ak_value) else float(ak_value)
 
-            def replace_cell(match):
-                row = int(match.group("row"))
-                if row not in result_by_row:
-                    return match.group(0)
+            # openpyxlが扱いやすいPython値へ変換
+            cleaned = []
+            for value in row:
+                if pd.isna(value):
+                    cleaned.append(None)
+                elif isinstance(value, np.generic):
+                    cleaned.append(value.item())
+                elif isinstance(value, pd.Timestamp):
+                    cleaned.append(value.to_pydatetime())
+                else:
+                    cleaned.append(value)
 
-                seen_rows.add(row)
-                attrs = match.group("attrs")
-                attrs = _re.sub(rb'\s+t="[^"]*"', b'', attrs)
-                value = result_by_row[row]
+            ws.append(cleaned)
 
-                if value is None or pd.isna(value):
-                    return b'<c' + attrs + b'></c>'
-
-                value_text = format(float(value), ".15g").encode("ascii")
-                return b'<c' + attrs + b'><v>' + value_text + b'</v></c>'
-
-            patched = cell_pat.sub(replace_cell, sheet_xml)
-
-            missing = set(result_by_row) - seen_rows
-            if missing:
-                row_pat = _re.compile(
-                    rb'<row(?P<attrs>[^>]*\br="(?P<row>\d+)"[^>]*)>(?P<body>.*?)</row>',
-                    _re.DOTALL,
-                )
-
-                def add_missing_cell(match):
-                    row = int(match.group("row"))
-                    if row not in missing:
-                        return match.group(0)
-
-                    value = result_by_row[row]
-                    if value is None or pd.isna(value):
-                        cell = f'<c r="AK{row}"></c>'.encode("ascii")
-                    else:
-                        value_text = format(float(value), ".15g")
-                        cell = f'<c r="AK{row}"><v>{value_text}</v></c>'.encode("ascii")
-
-                    return (
-                        b'<row'
-                        + match.group("attrs")
-                        + b'>'
-                        + match.group("body")
-                        + cell
-                        + b'</row>'
-                    )
-
-                patched = row_pat.sub(add_missing_cell, patched)
-
-            # 完成ファイルはディスクへ直接書く。
-            # 対象外エントリは zin.read() せずストリームコピー。
-            with zipfile.ZipFile(
-                tmp_path,
-                "w",
-                compression=zipfile.ZIP_DEFLATED,
-                compresslevel=1,
-                allowZip64=True,
-            ) as zout:
-                for item in zin.infolist():
-                    if item.filename == sheet_path:
-                        info = zipfile.ZipInfo(item.filename, date_time=item.date_time)
-                        info.compress_type = zipfile.ZIP_DEFLATED
-                        info.external_attr = item.external_attr
-                        info.create_system = item.create_system
-                        info.flag_bits = item.flag_bits
-                        zout.writestr(
-                            info,
-                            patched,
-                            compress_type=zipfile.ZIP_DEFLATED,
-                            compresslevel=1,
-                        )
-                    else:
-                        info = zipfile.ZipInfo(item.filename, date_time=item.date_time)
-                        info.compress_type = zipfile.ZIP_DEFLATED
-                        info.external_attr = item.external_attr
-                        info.create_system = item.create_system
-                        info.flag_bits = item.flag_bits
-
-                        with zin.open(item, "r") as src_entry:
-                            with zout.open(info, "w", force_zip64=True) as dst_entry:
-                                shutil.copyfileobj(
-                                    src_entry,
-                                    dst_entry,
-                                    length=1024 * 1024,
-                                )
-
+        wb.save(tmp_path)
+        wb.close()
         return tmp_path
 
     except Exception:
@@ -991,19 +881,6 @@ if uploaded_file is None:
 
 file_bytes = uploaded_file.getvalue()
 
-file_token = hashlib.sha1(
-    file_bytes[:1024 * 1024] + str(len(file_bytes)).encode()
-).hexdigest()
-
-if st.session_state.get("_uploaded_file_token") != file_token:
-    old_path = st.session_state.pop("ak_export_path", None)
-    if old_path:
-        try:
-            os.remove(old_path)
-        except OSError:
-            pass
-    st.session_state["_uploaded_file_token"] = file_token
-
 try:
     loaded_sheets = read_required_sheets(file_bytes)
     raw_df = loaded_sheets["後方数値データ(加工版)"]
@@ -1058,10 +935,11 @@ render_kpis(df)
 
 st.divider()
 st.subheader("📤 AK列計算済みデータのエクスポート")
-st.caption("AKは各行のB年月・AF・L・Mを使って計算します。60MB級ファイル対策として、元Excelを作り直さずAKセルだけを差し替えて出力します。")
+st.caption("AKは各行のB年月・AF・L・Mを使って計算します。60MB級ファイル対策として、後方数値データ(加工版)の1シートだけを新規Excelとして出力します。")
 
 if st.button("🛠️ AK列計算済みExcelを作成", key="create_ak_export"):
     try:
+        # 前回作成した一時ファイルがあれば削除
         old_path = st.session_state.pop("ak_export_path", None)
         if old_path:
             try:
@@ -1069,10 +947,10 @@ if st.button("🛠️ AK列計算済みExcelを作成", key="create_ak_export"):
             except OSError:
                 pass
 
-        with st.spinner("AK列を計算し、元ExcelのAKだけ差し替えています…"):
+        with st.spinner("AK列を計算し、1シートだけのExcelを作成しています…"):
             ak_results = build_ak_results(raw_df, cost_df)
-            st.session_state["ak_export_path"] = patch_ak_in_original_xlsx(
-                file_bytes,
+            st.session_state["ak_export_path"] = create_ak_one_sheet_xlsx(
+                raw_df,
                 ak_results,
             )
         st.success("作成できました。下のボタンからダウンロードできます。")
@@ -1132,12 +1010,7 @@ with tab_media:
     else:
         media_output = res[display_cols]
         st.dataframe(format_table(media_output), width="stretch", hide_index=True)
-        lazy_excel_download(
-            media_output,
-            label="媒体分析Excel",
-            file_name="媒体分析.xlsx",
-            key="media_export",
-        )
+        st.download_button("📥 媒体分析をダウンロード", to_excel(media_output), "媒体分析.xlsx")
 
     if "申込日" in df.columns and groups:
         default_trend_group = "中項目" if "中項目" in groups else groups[0]
@@ -1194,12 +1067,7 @@ with tab_win:
             combo = " × ".join(str(top[c]) for c in pattern_cols)
             direction = "最小" if ascending else "最大"
             st.success(f"{target_metric}が{direction}の勝ちパターン：{combo}")
-        lazy_excel_download(
-            win,
-            label="勝ちパターンExcel",
-            file_name="勝ちパターン.xlsx",
-            key="win_export",
-        )
+        st.download_button("📥 勝ちパターンをダウンロード", to_excel(win), "勝ちパターン.xlsx")
     allocation_simulator(win_df)
 
 with tab_cross:
@@ -1239,12 +1107,7 @@ with tab_cross:
         ranking = cross[ranking_cols].sort_values(metric, ascending=sort_ascending, na_position="last").head(top_n)
         st.dataframe(format_table(ranking), width="stretch", hide_index=True)
 
-        lazy_excel_download(
-            cross,
-            label="クロス分析Excel",
-            file_name="クロス分析.xlsx",
-            key="cross_export",
-        )
+        st.download_button("📥 クロス分析をダウンロード", to_excel(cross), "クロス分析.xlsx")
 
 with tab_seg:
     st.subheader("セグメント別分析")
@@ -1271,12 +1134,7 @@ with tab_seg:
     chart_df = seg_res[seg_res[seg].isin(selected_values)].set_index(seg)[[chart_metric]]
     st.bar_chart(chart_df)
     st.dataframe(format_table(seg_res), width="stretch", hide_index=True)
-    lazy_excel_download(
-        seg_res,
-        label="セグメント分析Excel",
-        file_name="セグメント分析.xlsx",
-        key="segment_export",
-    )
+    st.download_button("📥 セグメント分析をダウンロード", to_excel(seg_res), "セグメント分析.xlsx")
 
 with tab_mail:
     st.subheader("メルマガ分析（中項目 = Mail）")
@@ -1487,11 +1345,10 @@ with tab_mail:
                                 draw_grouped_mail_chart(chart_left, metric1)
                                 draw_grouped_mail_chart(chart_right, metric2)
 
-                                lazy_excel_download(
-                                    mail_res,
-                                    label="メルマガ分析Excel",
-                                    file_name="メルマガ分析_小項目別.xlsx",
-                                    key="mail_export",
+                                st.download_button(
+                                    "📥 メルマガ分析をダウンロード",
+                                    to_excel(mail_res),
+                                    "メルマガ分析_小項目別.xlsx",
                                 )
 
                                 # ======================
@@ -1658,15 +1515,14 @@ with tab_mail:
                                                 width="stretch",
                                             )
 
-                                        lazy_excel_download(
-                                            mail_segment_res,
-                                            label="メルマガのセグメント分析Excel",
-                                            file_name="メルマガ分析_セグメント別.xlsx",
-                                            key="mail_segment_export",
+                                        st.download_button(
+                                            "📥 メルマガのセグメント分析をダウンロード",
+                                            to_excel(mail_segment_res),
+                                            "メルマガ分析_セグメント別.xlsx",
                                         )
 
 # ======================
-# ブラウザ設定
+# ブラウザ設定の保存・初期化
 # ======================
 st.sidebar.divider()
 st.sidebar.subheader("⚙️ 個人設定")
