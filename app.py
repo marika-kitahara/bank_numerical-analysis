@@ -562,20 +562,56 @@ def _excel_key(value) -> str:
 
 
 def build_ak_results(raw_df: pd.DataFrame, cost_df: pd.DataFrame) -> list[float | None]:
-    """AK列へ入れる値だけを高速計算する。Excelファイルの再構築は行わない。"""
+    """AK列へ入れる値を計算する修正版。
+
+    コストデータ側の対応:
+    - B列 = 後方数値データ AF列
+    - C列 = 後方数値データ M列の性別
+      （双方とも文字列に「男性」または「女性」を含むかで照合）
+    - D列 = 後方数値データ L列の年齢を年代化した値（例: 56 -> 50代）
+    - E列以降 = 後方数値データ B列の年月
+    """
     if raw_df.shape[1] < 32:
         raise ValueError("後方数値データ(加工版)にAF列まで存在しません。")
+    if cost_df.shape[1] < 5:
+        raise ValueError("コストデータにE列まで存在しません。")
 
-    # 後方数値：B=1, C=2, D=3, L=11, M=12, AF=31 (0始まり)
+    # 後方数値：B=1, C=2, D=3, L=11, M=12, AF=31（0始まり）
     months = raw_df.iloc[:, 1].map(_excel_month_key)
     c_keys = raw_df.iloc[:, 2].map(_excel_key)
     d_keys = raw_df.iloc[:, 3].map(_excel_key)
-    l_keys = raw_df.iloc[:, 11].map(_excel_key)
-    m_keys = raw_df.iloc[:, 12].map(_excel_key)
+
+    l_values = raw_df.iloc[:, 11]   # 年齢
+    m_values = raw_df.iloc[:, 12]   # 性別（例: 1_男性 / 2_女性）
     af_keys = raw_df.iloc[:, 31].map(_excel_key)
 
-    # 分母：年月 × C × D の件数を一度だけ集計し、各行の L・M で参照する。
-    denom_source = pd.DataFrame({"month": months, "c": c_keys, "d": d_keys})
+    def age_group(value) -> str:
+        age = pd.to_numeric(value, errors="coerce")
+        if pd.isna(age):
+            return ""
+        decade = int(age) // 10 * 10
+        return f"{decade}代"
+
+    def gender_key(value) -> str:
+        text = "" if pd.isna(value) else str(value)
+        if "男性" in text:
+            return "男性"
+        if "女性" in text:
+            return "女性"
+        return ""
+
+    age_groups = l_values.map(age_group)
+    gender_keys = m_values.map(gender_key)
+
+    # 分母は従来要件を維持：
+    # 後方数値データ B列の年月 × C列 = その行のL列 × D列 = その行のM列
+    l_keys = l_values.map(_excel_key)
+    m_keys = m_values.map(_excel_key)
+    denom_source = pd.DataFrame({
+        "month": months,
+        "c": c_keys,
+        "d": d_keys,
+    })
     denom_counts = (
         denom_source[denom_source["month"].notna()]
         .groupby(["month", "c", "d"], dropna=False)
@@ -583,27 +619,55 @@ def build_ak_results(raw_df: pd.DataFrame, cost_df: pd.DataFrame) -> list[float 
         .to_dict()
     )
 
-    # 分子：コストデータ D列 × E列以降の年月。右端は自動追従。
+    # 分子：
+    # cost B = AF
+    # cost C は「男性/女性」を含むかで照合
+    # cost D = Lを年代化
+    # E以降 = 月
     numerator_lookup = {}
-    if cost_df.shape[1] >= 5:
-        cost_keys = cost_df.iloc[:, 3].map(_excel_key)
-        for col_idx in range(4, cost_df.shape[1]):
-            month = _excel_month_key(cost_df.columns[col_idx])
-            if not month:
-                continue
-            vals = pd.to_numeric(cost_df.iloc[:, col_idx], errors="coerce")
-            for key, val in zip(cost_keys, vals):
-                if key and pd.notna(val):
-                    numerator_lookup[(key, month)] = float(val)
 
-    return [
-        (numerator_lookup[(af_key, month)] / denom_counts[(month, lk, mk)])
-        if month is not None
-        and (af_key, month) in numerator_lookup
-        and denom_counts.get((month, lk, mk), 0)
-        else None
-        for month, af_key, lk, mk in zip(months, af_keys, l_keys, m_keys)
-    ]
+    cost_af_keys = cost_df.iloc[:, 1].map(_excel_key)       # B列
+    cost_gender_keys = cost_df.iloc[:, 2].map(gender_key)   # C列
+    cost_age_keys = cost_df.iloc[:, 3].map(_excel_key)      # D列
+
+    for col_idx in range(4, cost_df.shape[1]):
+        month = _excel_month_key(cost_df.columns[col_idx])
+        if not month:
+            continue
+
+        vals = pd.to_numeric(cost_df.iloc[:, col_idx], errors="coerce")
+
+        for af_key, gender, age_key, val in zip(
+            cost_af_keys,
+            cost_gender_keys,
+            cost_age_keys,
+            vals,
+        ):
+            if af_key and gender and age_key and pd.notna(val):
+                numerator_lookup[(af_key, gender, age_key, month)] = float(val)
+
+    results = []
+    for month, af_key, gender, age_key, lk, mk in zip(
+        months,
+        af_keys,
+        gender_keys,
+        age_groups,
+        l_keys,
+        m_keys,
+    ):
+        denominator = denom_counts.get((month, lk, mk), 0)
+        numerator = numerator_lookup.get((af_key, gender, age_key, month))
+
+        if (
+            month is not None
+            and numerator is not None
+            and denominator
+        ):
+            results.append(numerator / denominator)
+        else:
+            results.append(None)
+
+    return results
 
 
 def patch_ak_in_original_xlsx(file_bytes: bytes, ak_results: list[float | None]) -> bytes:
@@ -920,7 +984,7 @@ render_kpis(df)
 
 st.divider()
 st.subheader("📤 AK列計算済みデータのエクスポート")
-st.caption("AKは各行のB年月・AF・L・Mを使って計算します。出力は「後方数値データ(加工版)」1シートのみで、元の追加シートはコピーしません。")
+st.caption("AKは各行のB年月・AF・L・Mを使って計算します。AF→コストB列、Mの性別→コストC列（男性/女性を含むで照合）、Lの年齢→年代化してコストD列と照合します。出力は「後方数値データ(加工版)」1シートのみです。")
 
 if st.button("🛠️ AK列計算済みExcelを作成", key="create_ak_export"):
     try:
