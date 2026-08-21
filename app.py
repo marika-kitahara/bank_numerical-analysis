@@ -562,30 +562,56 @@ def _excel_key(value) -> str:
 
 
 def build_ak_results(raw_df: pd.DataFrame, cost_df: pd.DataFrame) -> list[float | None]:
-    """ユーザー確認済みExcel式の条件に合わせてAK値を計算する。
+    """Excelで検証済みの式をそのままPythonで再現する。
 
-    分子:
-      コストB = 後方AF
-      コストC = 後方Mの性別（「男性」「女性」を含む）
-      コストD = 後方Lを年代化した値（10代、20代...）
-      月 = 後方Bの年月
+    元の検証式:
+    =IFERROR(
+      INDEX(
+        コストデータ!$E:$XFD,
+        MATCH(
+          1,
+          (コストデータ!$B:$B=AF2)
+          *ISNUMBER(SEARCH(性別,コストデータ!$C:$C))
+          *(コストデータ!$D:$D=年代),
+          0
+        ),
+        MATCH(TEXT(B2,"yyyy/mm"),コストデータ!$E$1:$XFD$1,0)
+      )
+      /
+      XMATCH(
+        1,
+        IFERROR(
+          (コストデータ!$B$2:$B$100=AF2)
+          *ISNUMBER(SEARCH(性別,コストデータ!$C$2:$C$100))
+          *ISNUMBER(SEARCH(年代,コストデータ!$D$2:$D$100)),
+          0
+        ),
+        0
+      ),
+      ""
+    )
 
-    分母:
-      Excel式の XMATCH(1, 条件配列, 0) と同じく、
-      コストデータ2～100行の中で最初に条件一致する「位置（1始まり）」。
+    重要:
+    - 分子MATCHはコストデータ全行を検索
+    - 分母XMATCHだけExcel 2～100行（DataFrame先頭99行）を検索
     """
     if raw_df.shape[1] < 32:
         raise ValueError("後方数値データ(加工版)にAF列まで存在しません。")
     if cost_df.shape[1] < 5:
         raise ValueError("コストデータにE列まで存在しません。")
 
-    months = raw_df.iloc[:, 1].map(_excel_month_key)   # B
-    ages = raw_df.iloc[:, 11]                          # L
-    genders = raw_df.iloc[:, 12]                       # M
-    af_keys = raw_df.iloc[:, 31].map(_excel_key)       # AF
+    # 後方数値データ
+    # B=1, L=11, M=12, AF=31（0始まり）
+    months = raw_df.iloc[:, 1].map(_excel_month_key)
+    ages = raw_df.iloc[:, 11]
+    genders = raw_df.iloc[:, 12]
+    af_keys = raw_df.iloc[:, 31].map(_excel_key)
 
     def gender_key(value) -> str:
-        s = "" if pd.isna(value) else str(value)
+        """SEARCH相当。文字列中に男性/女性を含むかで正規化する。"""
+        if pd.isna(value):
+            return ""
+        s = str(value)
         if "男性" in s:
             return "男性"
         if "女性" in s:
@@ -593,6 +619,7 @@ def build_ak_results(raw_df: pd.DataFrame, cost_df: pd.DataFrame) -> list[float 
         return ""
 
     def decade_key(value) -> str:
+        """Excelの INT(L/10)*10&"代" と同じ。"""
         age = pd.to_numeric(value, errors="coerce")
         if pd.isna(age):
             return ""
@@ -601,47 +628,74 @@ def build_ak_results(raw_df: pd.DataFrame, cost_df: pd.DataFrame) -> list[float 
     raw_gender = genders.map(gender_key)
     raw_decade = ages.map(decade_key)
 
-    # Excel式の B2:B100 / C2:C100 / D2:D100 と同じ範囲
-    cost_match = cost_df.iloc[:99].copy()
-
-    cost_af = cost_match.iloc[:, 1].map(_excel_key)       # B
-    cost_gender = cost_match.iloc[:, 2].map(gender_key)   # C
-    cost_decade = cost_match.iloc[:, 3].map(_excel_key)   # D
-
-    # 月見出しを1回だけ辞書化
+    # --------------------------------------------------
+    # 月列MATCH
+    # Excelの見た目/実体が日付でも一致するよう YYYY-MM に正規化
+    # --------------------------------------------------
     month_to_col = {}
     for col_idx in range(4, cost_df.shape[1]):
         month = _excel_month_key(cost_df.columns[col_idx])
         if month and month not in month_to_col:
             month_to_col[month] = col_idx
 
-    # 条件ごとの「最初に一致する位置」を1回だけ辞書化
-    # key = (AF, 性別, 年代)
+    # --------------------------------------------------
+    # 分子 MATCH
+    # Excel式は B:B / C:C / D:D の「全行」が対象。
+    # --------------------------------------------------
+    full_cost_af = cost_df.iloc[:, 1].map(_excel_key)
+    full_cost_gender = cost_df.iloc[:, 2].map(gender_key)
+    full_cost_decade = cost_df.iloc[:, 3].map(_excel_key)
+
+    # (AF, 性別, 年代完全一致) -> 最初に一致したDataFrame行位置
+    numerator_row = {}
+    for row_pos, (af, gender, decade_text) in enumerate(
+        zip(full_cost_af, full_cost_gender, full_cost_decade)
+    ):
+        if not af or not gender or not decade_text:
+            continue
+
+        key = (af, gender, decade_text)
+        if key not in numerator_row:
+            numerator_row[key] = row_pos
+
+    # --------------------------------------------------
+    # 分母 XMATCH
+    # Excel式どおり B2:B100 / C2:C100 / D2:D100 の99行だけ。
+    # XMATCHは「件数」ではなく、最初に一致した位置（1始まり）を返す。
+    # D列だけ SEARCH なので年代は「含む」で判定。
+    # --------------------------------------------------
+    denom_cost = cost_df.iloc[:99]
+
+    denom_af = denom_cost.iloc[:, 1].map(_excel_key)
+    denom_gender = denom_cost.iloc[:, 2].map(gender_key)
+    denom_decade_text = denom_cost.iloc[:, 3].map(_excel_key)
+
     first_match_pos = {}
+
+    # 後方側に実際に存在する年代だけで辞書を作る
+    target_decades = {
+        d for d in raw_decade.tolist()
+        if d
+    }
+
     for pos, (af, gender, decade_text) in enumerate(
-        zip(cost_af, cost_gender, cost_decade),
+        zip(denom_af, denom_gender, denom_decade_text),
         start=1,
     ):
         if not af or not gender or not decade_text:
             continue
 
-        # 分母側のExcel式は年代に SEARCH を使うので、
-        # "50代" を含む文字列も拾えるように、その文字列自体を保持する。
-        for decade in [f"{n}代" for n in range(0, 110, 10)]:
-            if decade in str(decade_text):
+        decade_text = str(decade_text)
+
+        for decade in target_decades:
+            if decade in decade_text:
                 key = (af, gender, decade)
                 if key not in first_match_pos:
                     first_match_pos[key] = pos
 
-    # 分子側は D列完全一致なので、行位置を別辞書で持つ
-    numerator_row = {}
-    for pos0, (af, gender, decade_text) in enumerate(
-        zip(cost_af, cost_gender, cost_decade)
-    ):
-        key = (af, gender, decade_text)
-        if af and gender and decade_text and key not in numerator_row:
-            numerator_row[key] = pos0
-
+    # --------------------------------------------------
+    # 各行のAK値
+    # --------------------------------------------------
     results = []
 
     for month, af, gender, decade in zip(
@@ -654,16 +708,16 @@ def build_ak_results(raw_df: pd.DataFrame, cost_df: pd.DataFrame) -> list[float 
             results.append(None)
             continue
 
-        row_pos0 = numerator_row.get((af, gender, decade))
-        denominator = first_match_pos.get((af, gender, decade))
+        row_pos = numerator_row.get((af, gender, decade))
         col_idx = month_to_col.get(month)
+        denominator = first_match_pos.get((af, gender, decade))
 
-        if row_pos0 is None or not denominator or col_idx is None:
+        if row_pos is None or col_idx is None or not denominator:
             results.append(None)
             continue
 
         numerator = pd.to_numeric(
-            cost_match.iloc[row_pos0, col_idx],
+            cost_df.iloc[row_pos, col_idx],
             errors="coerce",
         )
 
@@ -1012,7 +1066,7 @@ render_kpis(df)
 
 st.divider()
 st.subheader("📤 AK列計算済みデータのエクスポート")
-st.caption("AKをPythonで計算し、「後方数値データ(加工版)」1シートだけを省メモリで出力します。元60MBブック全体は再構築しません。")
+st.caption("AKはExcelで検証済みの式と同じ条件でPython計算します。分子はコストデータ全行、分母XMATCHは2～100行を参照し、1シートだけ省メモリ出力します。")
 
 if st.button("🛠️ AK列計算済みExcelを作成", key="create_ak_export"):
     try:
@@ -1609,4 +1663,3 @@ with tab_mail:
 st.sidebar.divider()
 st.sidebar.subheader("⚙️ 個人設定")
 st.sidebar.caption("起動安定化のため、ブラウザへの設定保存機能は一時停止しています。")
-
