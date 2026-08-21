@@ -9,7 +9,10 @@ import pandas as pd
 import streamlit as st
 from openpyxl import load_workbook
 
-LocalStorage = None  # 起動安定化のためブラウザ保存機能を一時停止
+try:
+    from streamlit_local_storage import LocalStorage
+except ImportError:
+    LocalStorage = None
 
 st.set_page_config(page_title="後方数値データ分析", layout="wide")
 st.title("📊 後方数値データ分析ダッシュボード")
@@ -50,6 +53,7 @@ st.markdown(
 PREFERENCE_STORAGE_KEY = "rear_numeric_analysis_preferences_v4"
 PREFERENCE_SCHEMA_VERSION = 4
 PREFERENCE_KEYS = [
+    "data_sheet", "master_sheet", "use_cost_sheet", "cost_sheet",
     "filter_date_range", "filter_big", "filter_middle", "filter_small",
     "media_groups", "media_metrics", "media_trend_group", "media_trend_metric",
     "win_selected_middle", "win_pattern_cols", "win_target_metric", "win_min_count",
@@ -273,9 +277,8 @@ def collect_preferences():
     return result
 
 
-local_storage = None
-st.session_state["_browser_preferences_loaded"] = True
-st.session_state.pop("_pending_browser_preferences", None)
+local_storage = LocalStorage() if LocalStorage is not None else None
+load_browser_preferences(local_storage)
 initialize_restored_defaults_once()
 
 
@@ -562,56 +565,20 @@ def _excel_key(value) -> str:
 
 
 def build_ak_results(raw_df: pd.DataFrame, cost_df: pd.DataFrame) -> list[float | None]:
-    """AK列へ入れる値を計算する修正版。
-
-    コストデータ側の対応:
-    - B列 = 後方数値データ AF列
-    - C列 = 後方数値データ M列の性別
-      （双方とも文字列に「男性」または「女性」を含むかで照合）
-    - D列 = 後方数値データ L列の年齢を年代化した値（例: 56 -> 50代）
-    - E列以降 = 後方数値データ B列の年月
-    """
+    """AK列へ入れる値だけを高速計算する。Excelファイルの再構築は行わない。"""
     if raw_df.shape[1] < 32:
         raise ValueError("後方数値データ(加工版)にAF列まで存在しません。")
-    if cost_df.shape[1] < 5:
-        raise ValueError("コストデータにE列まで存在しません。")
 
-    # 後方数値：B=1, C=2, D=3, L=11, M=12, AF=31（0始まり）
+    # 後方数値：B=1, C=2, D=3, L=11, M=12, AF=31 (0始まり)
     months = raw_df.iloc[:, 1].map(_excel_month_key)
     c_keys = raw_df.iloc[:, 2].map(_excel_key)
     d_keys = raw_df.iloc[:, 3].map(_excel_key)
-
-    l_values = raw_df.iloc[:, 11]   # 年齢
-    m_values = raw_df.iloc[:, 12]   # 性別（例: 1_男性 / 2_女性）
+    l_keys = raw_df.iloc[:, 11].map(_excel_key)
+    m_keys = raw_df.iloc[:, 12].map(_excel_key)
     af_keys = raw_df.iloc[:, 31].map(_excel_key)
 
-    def age_group(value) -> str:
-        age = pd.to_numeric(value, errors="coerce")
-        if pd.isna(age):
-            return ""
-        decade = int(age) // 10 * 10
-        return f"{decade}代"
-
-    def gender_key(value) -> str:
-        text = "" if pd.isna(value) else str(value)
-        if "男性" in text:
-            return "男性"
-        if "女性" in text:
-            return "女性"
-        return ""
-
-    age_groups = l_values.map(age_group)
-    gender_keys = m_values.map(gender_key)
-
-    # 分母は従来要件を維持：
-    # 後方数値データ B列の年月 × C列 = その行のL列 × D列 = その行のM列
-    l_keys = l_values.map(_excel_key)
-    m_keys = m_values.map(_excel_key)
-    denom_source = pd.DataFrame({
-        "month": months,
-        "c": c_keys,
-        "d": d_keys,
-    })
+    # 分母：年月 × C × D の件数を一度だけ集計し、各行の L・M で参照する。
+    denom_source = pd.DataFrame({"month": months, "c": c_keys, "d": d_keys})
     denom_counts = (
         denom_source[denom_source["month"].notna()]
         .groupby(["month", "c", "d"], dropna=False)
@@ -619,115 +586,131 @@ def build_ak_results(raw_df: pd.DataFrame, cost_df: pd.DataFrame) -> list[float 
         .to_dict()
     )
 
-    # 分子：
-    # cost B = AF
-    # cost C は「男性/女性」を含むかで照合
-    # cost D = Lを年代化
-    # E以降 = 月
+    # 分子：コストデータ D列 × E列以降の年月。右端は自動追従。
     numerator_lookup = {}
+    if cost_df.shape[1] >= 5:
+        cost_keys = cost_df.iloc[:, 3].map(_excel_key)
+        for col_idx in range(4, cost_df.shape[1]):
+            month = _excel_month_key(cost_df.columns[col_idx])
+            if not month:
+                continue
+            vals = pd.to_numeric(cost_df.iloc[:, col_idx], errors="coerce")
+            for key, val in zip(cost_keys, vals):
+                if key and pd.notna(val):
+                    numerator_lookup[(key, month)] = float(val)
 
-    cost_af_keys = cost_df.iloc[:, 1].map(_excel_key)       # B列
-    cost_gender_keys = cost_df.iloc[:, 2].map(gender_key)   # C列
-    cost_age_keys = cost_df.iloc[:, 3].map(_excel_key)      # D列
-
-    for col_idx in range(4, cost_df.shape[1]):
-        month = _excel_month_key(cost_df.columns[col_idx])
-        if not month:
-            continue
-
-        vals = pd.to_numeric(cost_df.iloc[:, col_idx], errors="coerce")
-
-        for af_key, gender, age_key, val in zip(
-            cost_af_keys,
-            cost_gender_keys,
-            cost_age_keys,
-            vals,
-        ):
-            if af_key and gender and age_key and pd.notna(val):
-                numerator_lookup[(af_key, gender, age_key, month)] = float(val)
-
-    results = []
-    for month, af_key, gender, age_key, lk, mk in zip(
-        months,
-        af_keys,
-        gender_keys,
-        age_groups,
-        l_keys,
-        m_keys,
-    ):
-        denominator = denom_counts.get((month, lk, mk), 0)
-        numerator = numerator_lookup.get((af_key, gender, age_key, month))
-
-        if (
-            month is not None
-            and numerator is not None
-            and denominator
-        ):
-            results.append(numerator / denominator)
-        else:
-            results.append(None)
-
-    return results
+    return [
+        (numerator_lookup[(af_key, month)] / denom_counts[(month, lk, mk)])
+        if month is not None
+        and (af_key, month) in numerator_lookup
+        and denom_counts.get((month, lk, mk), 0)
+        else None
+        for month, af_key, lk, mk in zip(months, af_keys, l_keys, m_keys)
+    ]
 
 
 def patch_ak_in_original_xlsx(file_bytes: bytes, ak_results: list[float | None]) -> bytes:
-    """AK計算済みの『後方数値データ(加工版)』1シートだけを新規Excelに出力する。
+    """元xlsxのZIP構造をそのまま使い、対象シートXMLのAKセルだけ差し替える。
 
-    起動確認済みコードへの変更を最小限にするため、
-    関数名・引数・戻り値(bytes)は既存のまま維持する。
-    元60MBブックや追加シートはコピーしない。
+    全セルをopenpyxlで書き直さないため、60MB級ファイルでも処理時間とメモリを大幅に抑える。
+    他セル・書式・他シートは元ファイルをそのまま保持する。
     """
-    from openpyxl import Workbook
+    import posixpath
+    import re as _re
+    import zipfile
+    from xml.etree import ElementTree as ET
 
-    if len(raw_df) != len(ak_results):
-        raise ValueError("AK計算結果と後方数値データの行数が一致しません。")
+    src = BytesIO(file_bytes)
+    out = BytesIO()
 
-    output = BytesIO()
-    wb = Workbook(write_only=True)
-    ws = wb.create_sheet(title="後方数値データ(加工版)")
+    with zipfile.ZipFile(src, "r") as zin:
+        # workbook.xml から対象シートの relationship id を取得。
+        wb_root = ET.fromstring(zin.read("xl/workbook.xml"))
+        ns = {
+            "main": "http://schemas.openxmlformats.org/spreadsheetml/2006/main",
+            "r": "http://schemas.openxmlformats.org/officeDocument/2006/relationships",
+        }
+        rel_id = None
+        for sheet in wb_root.findall("main:sheets/main:sheet", ns):
+            if sheet.attrib.get("name") == "後方数値データ(加工版)":
+                rel_id = sheet.attrib.get("{http://schemas.openxmlformats.org/officeDocument/2006/relationships}id")
+                break
+        if not rel_id:
+            raise ValueError("『後方数値データ(加工版)』シートが見つかりません。")
 
-    headers = [str(c) for c in raw_df.columns]
-    while len(headers) < 37:
-        headers.append("")
-    headers[36] = "コスト"
-    ws.append(headers)
+        rel_root = ET.fromstring(zin.read("xl/_rels/workbook.xml.rels"))
+        target = None
+        for rel in rel_root:
+            if rel.attrib.get("Id") == rel_id:
+                target = rel.attrib.get("Target")
+                break
+        if not target:
+            raise ValueError("対象シートの内部XMLを特定できません。")
 
-    for row_values, ak_value in zip(
-        raw_df.itertuples(index=False, name=None),
-        ak_results,
-    ):
-        row = list(row_values)
-        while len(row) < 37:
-            row.append(None)
+        if target.startswith("/"):
+            sheet_path = target.lstrip("/")
+        else:
+            sheet_path = posixpath.normpath(posixpath.join("xl", target))
 
-        row[36] = (
-            None
-            if ak_value is None or pd.isna(ak_value)
-            else float(ak_value)
+        # AKセルは既存セルの属性（style等）を残したまま値だけ差し替える。
+        # 元データの1行目はヘッダーなので、DataFrame index 0 -> Excel row 2。
+        sheet_xml = zin.read(sheet_path)
+        result_by_row = {i + 2: v for i, v in enumerate(ak_results)}
+
+        cell_pat = _re.compile(
+            rb'<c(?P<attrs>[^>]*\br="AK(?P<row>\d+)"[^>]*)>(?P<body>.*?)</c>',
+            _re.DOTALL,
         )
+        seen_rows = set()
 
-        cleaned = []
-        for value in row:
-            try:
-                is_missing = pd.isna(value)
-                if isinstance(is_missing, (bool, np.bool_)) and is_missing:
-                    cleaned.append(None)
-                    continue
-            except Exception:
-                pass
+        def replace_cell(match):
+            row = int(match.group("row"))
+            if row not in result_by_row:
+                return match.group(0)
+            seen_rows.add(row)
+            attrs = match.group("attrs")
+            # inlineStr / shared-string等の型指定は数値と両立しないため除去。
+            attrs = _re.sub(rb'\s+t="[^"]*"', b'', attrs)
+            value = result_by_row[row]
+            if value is None or pd.isna(value):
+                return b'<c' + attrs + b'></c>'
+            value_text = format(float(value), ".15g").encode("ascii")
+            return b'<c' + attrs + b'><v>' + value_text + b'</v></c>'
 
-            if isinstance(value, np.generic):
-                cleaned.append(value.item())
-            elif isinstance(value, pd.Timestamp):
-                cleaned.append(value.to_pydatetime())
-            else:
-                cleaned.append(value)
+        patched = cell_pat.sub(replace_cell, sheet_xml)
 
-        ws.append(cleaned)
+        # AKセル自体が存在しない行があれば、その行XMLの末尾へ追加する。
+        missing = set(result_by_row) - seen_rows
+        if missing:
+            row_pat = _re.compile(rb'<row(?P<attrs>[^>]*\br="(?P<row>\d+)"[^>]*)>(?P<body>.*?)</row>', _re.DOTALL)
 
-    wb.save(output)
-    wb.close()
-    return output.getvalue()
+            def add_missing_cell(match):
+                row = int(match.group("row"))
+                if row not in missing:
+                    return match.group(0)
+                value = result_by_row[row]
+                if value is None or pd.isna(value):
+                    cell = f'<c r="AK{row}"></c>'.encode("ascii")
+                else:
+                    value_text = format(float(value), ".15g")
+                    cell = f'<c r="AK{row}"><v>{value_text}</v></c>'.encode("ascii")
+                return b'<row' + match.group("attrs") + b'>' + match.group("body") + cell + b'</row>'
+
+            patched = row_pat.sub(add_missing_cell, patched)
+
+        # それ以外のZIPエントリはコピー。対象sheet XMLだけ置換。
+        with zipfile.ZipFile(out, "w", compression=zipfile.ZIP_DEFLATED, compresslevel=1) as zout:
+            for item in zin.infolist():
+                data = patched if item.filename == sheet_path else zin.read(item.filename)
+                # ZipInfoをそのまま使うと元の圧縮設定が引き継がれるので、新規Infoで軽圧縮。
+                info = zipfile.ZipInfo(item.filename, date_time=item.date_time)
+                info.compress_type = zipfile.ZIP_DEFLATED
+                info.external_attr = item.external_attr
+                info.create_system = item.create_system
+                info.flag_bits = item.flag_bits
+                zout.writestr(info, data, compress_type=zipfile.ZIP_DEFLATED, compresslevel=1)
+
+    return out.getvalue()
 
 
 def metric_options(df: pd.DataFrame) -> list[str]:
@@ -984,11 +967,11 @@ render_kpis(df)
 
 st.divider()
 st.subheader("📤 AK列計算済みデータのエクスポート")
-st.caption("AKは各行のB年月・AF・L・Mを使って計算します。AF→コストB列、Mの性別→コストC列（男性/女性を含むで照合）、Lの年齢→年代化してコストD列と照合します。出力は「後方数値データ(加工版)」1シートのみです。")
+st.caption("AKは各行のB年月・AF・L・Mを使って計算します。60MB級ファイル対策として、元Excelを作り直さずAKセルだけを差し替えて出力します。")
 
 if st.button("🛠️ AK列計算済みExcelを作成", key="create_ak_export"):
     try:
-        with st.spinner("AK列を計算し、1シートだけのExcelを作成しています…"):
+        with st.spinner("AK列を計算し、元ExcelのAKだけ差し替えています…"):
             ak_results = build_ak_results(raw_df, cost_df)
             st.session_state["ak_export_bytes"] = patch_ak_in_original_xlsx(file_bytes, ak_results)
         st.success("作成できました。下のボタンからダウンロードできます。")
@@ -1027,7 +1010,7 @@ with tab_media:
     media_group_defaults = [c for c in admin_default("media_groups", default_groups) if c in dimension_cols]
     ensure_widget_default("media_groups", media_group_defaults, dimension_cols, multiple=True)
     consume_saved_preference("media_groups", dimension_cols, default=media_group_defaults, multiple=True)
-    groups = st.multiselect("集計軸", dimension_cols, key="media_groups")
+    groups = st.multiselect("集計軸", dimension_cols, default=media_group_defaults, key="media_groups")
     default_metrics = [m for m in CORE_METRICS if m in all_metrics]
     metric_actions = st.columns([1, 1, 6])
     if metric_actions[0].button("全選択", key="media_select_all"):
@@ -1037,7 +1020,7 @@ with tab_media:
         st.session_state["media_metrics"] = default_metrics
         st.rerun()
     consume_saved_preference("media_metrics", all_metrics, default=default_metrics, multiple=True)
-    selected_metrics = st.multiselect("表示項目", all_metrics, key="media_metrics")
+    selected_metrics = st.multiselect("表示項目", all_metrics, default=default_metrics, key="media_metrics")
     res = aggregate(df, groups)
     res = add_extra_numeric_sums(df, res, groups, selected_metrics)
     display_cols = list(dict.fromkeys(groups + [m for m in selected_metrics if m in res.columns]))
@@ -1086,7 +1069,7 @@ with tab_win:
     pattern_options = [c for c in ["小項目", "媒体名", "キャンペーン識別", "年齢グループ", "年収グループ", "性別", "利用目的", "都道府県"] if c in dimension_cols]
     pattern_defaults = [c for c in admin_default("win_pattern_cols", ["小項目", "利用目的", "年齢グループ"]) if c in pattern_options]
     consume_saved_preference("win_pattern_cols", pattern_options, default=pattern_defaults, multiple=True)
-    pattern_cols = st.multiselect("勝ちパターンの組み合わせ", pattern_options, key="win_pattern_cols")
+    pattern_cols = st.multiselect("勝ちパターンの組み合わせ", pattern_options, default=pattern_defaults, key="win_pattern_cols")
     win_metric_options = ["承認率", "申込件数", "投下倍率", "取扱金額_翌月", "申込CPA", "承認CPA", "成約件数", "成約率"]
     consume_saved_preference("win_target_metric", win_metric_options, default=admin_default("win_target_metric", "承認率"))
     consume_saved_preference("win_min_count", default=admin_default("win_min_count", 30))
@@ -1562,4 +1545,21 @@ with tab_mail:
 # ======================
 st.sidebar.divider()
 st.sidebar.subheader("⚙️ 個人設定")
-st.sidebar.caption("起動安定化のため、ブラウザへの設定保存機能は一時停止しています。")
+if LocalStorage is None:
+    st.sidebar.warning("ブラウザ保存機能を使うには requirements.txt に streamlit-local-storage を追加してください。")
+else:
+    st.sidebar.caption("コード側のデフォルトを維持し、保存した項目だけこのブラウザで復元します。")
+    if st.sidebar.button("💾 現在の設定を保存", width="stretch", key="save_browser_preferences"):
+        payload = json.dumps({"schema_version": PREFERENCE_SCHEMA_VERSION, "values": collect_preferences()}, ensure_ascii=False)
+        storage_set_item(local_storage, PREFERENCE_STORAGE_KEY, payload, component_key="save_preferences_component")
+        time.sleep(0.8)
+        st.sidebar.success("このブラウザに設定を保存しました。")
+
+    if st.sidebar.button("↩️ 保存設定を初期化", width="stretch", key="reset_browser_preferences"):
+        storage_set_item(local_storage, PREFERENCE_STORAGE_KEY, "", component_key="reset_preferences_component")
+        for pref_key in PREFERENCE_KEYS:
+            st.session_state.pop(pref_key, None)
+        st.session_state.pop("_pending_browser_preferences", None)
+        st.session_state["_browser_preferences_loaded"] = True
+        time.sleep(0.8)
+        st.rerun()
