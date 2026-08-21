@@ -7,6 +7,7 @@ import numpy as np
 import altair as alt
 import pandas as pd
 import streamlit as st
+from openpyxl import load_workbook
 
 try:
     from streamlit_local_storage import LocalStorage
@@ -542,6 +543,102 @@ def to_excel(df: pd.DataFrame) -> bytes:
     return output.getvalue()
 
 
+def _excel_month_key(value) -> str | None:
+    """Excelセル値を YYYY-MM に正規化する。"""
+    if value in (None, ""):
+        return None
+    dt = pd.to_datetime(value, errors="coerce")
+    if pd.notna(dt):
+        return pd.Timestamp(dt).strftime("%Y-%m")
+    text = str(value).strip()
+    m = re.search(r"(20\d{2})\D*(\d{1,2})", text)
+    return f"{m.group(1)}-{int(m.group(2)):02d}" if m else None
+
+
+def _excel_key(value) -> str:
+    """MATCH/COUNTIFS用に文字列キーを揃える。"""
+    if value is None:
+        return ""
+    if isinstance(value, float) and value.is_integer():
+        return str(int(value))
+    return str(value).strip()
+
+
+@st.cache_data(show_spinner="AK列を計算したExcelを作成しています…")
+def build_ak_export(file_bytes: bytes) -> bytes:
+    """元ブックの『後方数値データ(加工版)』を保ったままAK列だけ計算して返す。
+
+    計算仕様:
+      numerator = INDEX(コストデータ!E:右端, MATCH(AF行, コストデータ!D:D), MATCH(B行の年月, 月見出し))
+      denominator = 各行ごとに、後方数値データで B列の年月が同じ かつ C列=L行 かつ D列=M行 の件数
+      AK = numerator / denominator
+
+    コストデータの月列はE列以降を右端まで動的に探索する。
+    """
+    wb = load_workbook(BytesIO(file_bytes), data_only=False)
+    target_name = "後方数値データ(加工版)"
+    cost_name = "コストデータ"
+    if target_name not in wb.sheetnames or cost_name not in wb.sheetnames:
+        raise ValueError("『後方数値データ(加工版)』または『コストデータ』シートがありません。")
+
+    ws = wb[target_name]
+    cost_ws = wb[cost_name]
+
+    # コストデータ D列のキー → 行番号
+    cost_row_by_key = {}
+    for r in range(2, cost_ws.max_row + 1):
+        key = _excel_key(cost_ws.cell(r, 4).value)
+        if key:
+            cost_row_by_key[key] = r
+
+    # コストデータ E列以降の年月 → 列番号（V列より右に増えても対応）
+    cost_col_by_month = {}
+    for c in range(5, cost_ws.max_column + 1):
+        month = _excel_month_key(cost_ws.cell(1, c).value)
+        if month:
+            cost_col_by_month[month] = c
+
+    # 分母用に「年月 × C列 × D列」の件数を一度だけ集計する。
+    # 各出力行では、その行自身の L列・M列を条件として参照する。
+    denominator_counts = {}
+    for r in range(2, ws.max_row + 1):
+        month = _excel_month_key(ws.cell(r, 2).value)  # B列
+        c_key = _excel_key(ws.cell(r, 3).value)        # C列
+        d_key = _excel_key(ws.cell(r, 4).value)        # D列
+        if not month:
+            continue
+        group_key = (month, c_key, d_key)
+        denominator_counts[group_key] = denominator_counts.get(group_key, 0) + 1
+
+    # AK列 = 37列目。元シートの他セルには触れない。
+    for r in range(2, ws.max_row + 1):
+        month = _excel_month_key(ws.cell(r, 2).value)  # B列
+        af_key = _excel_key(ws.cell(r, 32).value)      # AF列
+        criterion_c = _excel_key(ws.cell(r, 12).value)  # L列：各行
+        criterion_d = _excel_key(ws.cell(r, 13).value)  # M列：各行
+        denominator = denominator_counts.get((month, criterion_c, criterion_d), 0)
+        cost_row = cost_row_by_key.get(af_key)
+        cost_col = cost_col_by_month.get(month)
+
+        result = None
+        if denominator and cost_row and cost_col:
+            numerator = cost_ws.cell(cost_row, cost_col).value
+            numerator = pd.to_numeric(numerator, errors="coerce")
+            if pd.notna(numerator):
+                result = float(numerator) / denominator
+
+        ws.cell(r, 37).value = result
+
+    # エクスポート対象は指定シートのみ。対象シート自体のセル・書式は元ブックを利用。
+    for sheet_name in list(wb.sheetnames):
+        if sheet_name != target_name:
+            del wb[sheet_name]
+
+    output = BytesIO()
+    wb.save(output)
+    return output.getvalue()
+
+
 def metric_options(df: pd.DataFrame) -> list[str]:
     # 分類・識別系の列は、Excel上で全空欄だと数値型(float)判定されることがある。
     # それらを表示指標に混ぜず、実際の数値項目だけを候補にする。
@@ -791,6 +888,21 @@ if df.empty:
     st.stop()
 
 render_kpis(df)
+
+st.divider()
+st.subheader("📤 AK列計算済みデータのエクスポート")
+st.caption("元の『後方数値データ(加工版)』をそのまま使い、AK列だけ指定計算で更新したExcelを出力します。")
+try:
+    ak_export_bytes = build_ak_export(file_bytes)
+    st.download_button(
+        "📥 AK列計算済みの後方数値データをダウンロード",
+        ak_export_bytes,
+        "後方数値データ_AK計算済み.xlsx",
+        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        key="download_ak_export",
+    )
+except Exception as exc:
+    st.error(f"AK列計算済みExcelの作成に失敗しました: {exc}")
 
 # 分析軸候補：日付・識別・属性列。内部計算列は除外
 internal_cols = {"申込フラグ", "承認フラグ", "成約フラグ", "コスト_元データ", "コスト補完フラグ", "媒体月申込件数", "補完元コスト"}
