@@ -562,152 +562,200 @@ def _excel_key(value) -> str:
 
 
 def build_ak_results(raw_df: pd.DataFrame, cost_df: pd.DataFrame) -> list[float | None]:
-    """AK列へ入れる値だけを高速計算する。Excelファイルの再構築は行わない。"""
+    """ユーザー確認済みExcel式の条件に合わせてAK値を計算する。
+
+    分子:
+      コストB = 後方AF
+      コストC = 後方Mの性別（「男性」「女性」を含む）
+      コストD = 後方Lを年代化した値（10代、20代...）
+      月 = 後方Bの年月
+
+    分母:
+      Excel式の XMATCH(1, 条件配列, 0) と同じく、
+      コストデータ2～100行の中で最初に条件一致する「位置（1始まり）」。
+    """
     if raw_df.shape[1] < 32:
         raise ValueError("後方数値データ(加工版)にAF列まで存在しません。")
+    if cost_df.shape[1] < 5:
+        raise ValueError("コストデータにE列まで存在しません。")
 
-    # 後方数値：B=1, C=2, D=3, L=11, M=12, AF=31 (0始まり)
-    months = raw_df.iloc[:, 1].map(_excel_month_key)
-    c_keys = raw_df.iloc[:, 2].map(_excel_key)
-    d_keys = raw_df.iloc[:, 3].map(_excel_key)
-    l_keys = raw_df.iloc[:, 11].map(_excel_key)
-    m_keys = raw_df.iloc[:, 12].map(_excel_key)
-    af_keys = raw_df.iloc[:, 31].map(_excel_key)
+    months = raw_df.iloc[:, 1].map(_excel_month_key)   # B
+    ages = raw_df.iloc[:, 11]                          # L
+    genders = raw_df.iloc[:, 12]                       # M
+    af_keys = raw_df.iloc[:, 31].map(_excel_key)       # AF
 
-    # 分母：年月 × C × D の件数を一度だけ集計し、各行の L・M で参照する。
-    denom_source = pd.DataFrame({"month": months, "c": c_keys, "d": d_keys})
-    denom_counts = (
-        denom_source[denom_source["month"].notna()]
-        .groupby(["month", "c", "d"], dropna=False)
-        .size()
-        .to_dict()
-    )
+    def gender_key(value) -> str:
+        s = "" if pd.isna(value) else str(value)
+        if "男性" in s:
+            return "男性"
+        if "女性" in s:
+            return "女性"
+        return ""
 
-    # 分子：コストデータ D列 × E列以降の年月。右端は自動追従。
-    numerator_lookup = {}
-    if cost_df.shape[1] >= 5:
-        cost_keys = cost_df.iloc[:, 3].map(_excel_key)
-        for col_idx in range(4, cost_df.shape[1]):
-            month = _excel_month_key(cost_df.columns[col_idx])
-            if not month:
-                continue
-            vals = pd.to_numeric(cost_df.iloc[:, col_idx], errors="coerce")
-            for key, val in zip(cost_keys, vals):
-                if key and pd.notna(val):
-                    numerator_lookup[(key, month)] = float(val)
+    def decade_key(value) -> str:
+        age = pd.to_numeric(value, errors="coerce")
+        if pd.isna(age):
+            return ""
+        return f"{int(age) // 10 * 10}代"
 
-    return [
-        (numerator_lookup[(af_key, month)] / denom_counts[(month, lk, mk)])
-        if month is not None
-        and (af_key, month) in numerator_lookup
-        and denom_counts.get((month, lk, mk), 0)
-        else None
-        for month, af_key, lk, mk in zip(months, af_keys, l_keys, m_keys)
-    ]
+    raw_gender = genders.map(gender_key)
+    raw_decade = ages.map(decade_key)
 
+    # Excel式の B2:B100 / C2:C100 / D2:D100 と同じ範囲
+    cost_match = cost_df.iloc[:99].copy()
 
-def patch_ak_in_original_xlsx(file_bytes: bytes, ak_results: list[float | None]) -> bytes:
-    """元xlsxのZIP構造をそのまま使い、対象シートXMLのAKセルだけ差し替える。
+    cost_af = cost_match.iloc[:, 1].map(_excel_key)       # B
+    cost_gender = cost_match.iloc[:, 2].map(gender_key)   # C
+    cost_decade = cost_match.iloc[:, 3].map(_excel_key)   # D
 
-    全セルをopenpyxlで書き直さないため、60MB級ファイルでも処理時間とメモリを大幅に抑える。
-    他セル・書式・他シートは元ファイルをそのまま保持する。
-    """
-    import posixpath
-    import re as _re
-    import zipfile
-    from xml.etree import ElementTree as ET
+    # 月見出しを1回だけ辞書化
+    month_to_col = {}
+    for col_idx in range(4, cost_df.shape[1]):
+        month = _excel_month_key(cost_df.columns[col_idx])
+        if month and month not in month_to_col:
+            month_to_col[month] = col_idx
 
-    src = BytesIO(file_bytes)
-    out = BytesIO()
+    # 条件ごとの「最初に一致する位置」を1回だけ辞書化
+    # key = (AF, 性別, 年代)
+    first_match_pos = {}
+    for pos, (af, gender, decade_text) in enumerate(
+        zip(cost_af, cost_gender, cost_decade),
+        start=1,
+    ):
+        if not af or not gender or not decade_text:
+            continue
 
-    with zipfile.ZipFile(src, "r") as zin:
-        # workbook.xml から対象シートの relationship id を取得。
-        wb_root = ET.fromstring(zin.read("xl/workbook.xml"))
-        ns = {
-            "main": "http://schemas.openxmlformats.org/spreadsheetml/2006/main",
-            "r": "http://schemas.openxmlformats.org/officeDocument/2006/relationships",
-        }
-        rel_id = None
-        for sheet in wb_root.findall("main:sheets/main:sheet", ns):
-            if sheet.attrib.get("name") == "後方数値データ(加工版)":
-                rel_id = sheet.attrib.get("{http://schemas.openxmlformats.org/officeDocument/2006/relationships}id")
-                break
-        if not rel_id:
-            raise ValueError("『後方数値データ(加工版)』シートが見つかりません。")
+        # 分母側のExcel式は年代に SEARCH を使うので、
+        # "50代" を含む文字列も拾えるように、その文字列自体を保持する。
+        for decade in [f"{n}代" for n in range(0, 110, 10)]:
+            if decade in str(decade_text):
+                key = (af, gender, decade)
+                if key not in first_match_pos:
+                    first_match_pos[key] = pos
 
-        rel_root = ET.fromstring(zin.read("xl/_rels/workbook.xml.rels"))
-        target = None
-        for rel in rel_root:
-            if rel.attrib.get("Id") == rel_id:
-                target = rel.attrib.get("Target")
-                break
-        if not target:
-            raise ValueError("対象シートの内部XMLを特定できません。")
+    # 分子側は D列完全一致なので、行位置を別辞書で持つ
+    numerator_row = {}
+    for pos0, (af, gender, decade_text) in enumerate(
+        zip(cost_af, cost_gender, cost_decade)
+    ):
+        key = (af, gender, decade_text)
+        if af and gender and decade_text and key not in numerator_row:
+            numerator_row[key] = pos0
 
-        if target.startswith("/"):
-            sheet_path = target.lstrip("/")
-        else:
-            sheet_path = posixpath.normpath(posixpath.join("xl", target))
+    results = []
 
-        # AKセルは既存セルの属性（style等）を残したまま値だけ差し替える。
-        # 元データの1行目はヘッダーなので、DataFrame index 0 -> Excel row 2。
-        sheet_xml = zin.read(sheet_path)
-        result_by_row = {i + 2: v for i, v in enumerate(ak_results)}
+    for month, af, gender, decade in zip(
+        months,
+        af_keys,
+        raw_gender,
+        raw_decade,
+    ):
+        if not month or not af or not gender or not decade:
+            results.append(None)
+            continue
 
-        cell_pat = _re.compile(
-            rb'<c(?P<attrs>[^>]*\br="AK(?P<row>\d+)"[^>]*)>(?P<body>.*?)</c>',
-            _re.DOTALL,
+        row_pos0 = numerator_row.get((af, gender, decade))
+        denominator = first_match_pos.get((af, gender, decade))
+        col_idx = month_to_col.get(month)
+
+        if row_pos0 is None or not denominator or col_idx is None:
+            results.append(None)
+            continue
+
+        numerator = pd.to_numeric(
+            cost_match.iloc[row_pos0, col_idx],
+            errors="coerce",
         )
-        seen_rows = set()
 
-        def replace_cell(match):
-            row = int(match.group("row"))
-            if row not in result_by_row:
-                return match.group(0)
-            seen_rows.add(row)
-            attrs = match.group("attrs")
-            # inlineStr / shared-string等の型指定は数値と両立しないため除去。
-            attrs = _re.sub(rb'\s+t="[^"]*"', b'', attrs)
-            value = result_by_row[row]
-            if value is None or pd.isna(value):
-                return b'<c' + attrs + b'></c>'
-            value_text = format(float(value), ".15g").encode("ascii")
-            return b'<c' + attrs + b'><v>' + value_text + b'</v></c>'
+        if pd.isna(numerator):
+            results.append(None)
+            continue
 
-        patched = cell_pat.sub(replace_cell, sheet_xml)
+        results.append(float(numerator) / float(denominator))
 
-        # AKセル自体が存在しない行があれば、その行XMLの末尾へ追加する。
-        missing = set(result_by_row) - seen_rows
-        if missing:
-            row_pat = _re.compile(rb'<row(?P<attrs>[^>]*\br="(?P<row>\d+)"[^>]*)>(?P<body>.*?)</row>', _re.DOTALL)
+    return results
 
-            def add_missing_cell(match):
-                row = int(match.group("row"))
-                if row not in missing:
-                    return match.group(0)
-                value = result_by_row[row]
-                if value is None or pd.isna(value):
-                    cell = f'<c r="AK{row}"></c>'.encode("ascii")
-                else:
-                    value_text = format(float(value), ".15g")
-                    cell = f'<c r="AK{row}"><v>{value_text}</v></c>'.encode("ascii")
-                return b'<row' + match.group("attrs") + b'>' + match.group("body") + cell + b'</row>'
 
-            patched = row_pat.sub(add_missing_cell, patched)
+def patch_ak_in_original_xlsx(file_bytes: bytes, ak_results: list[float | None]) -> str:
+    """後方数値データ(加工版)1シートだけを省メモリで一時xlsxへ出力する。
 
-        # それ以外のZIPエントリはコピー。対象sheet XMLだけ置換。
-        with zipfile.ZipFile(out, "w", compression=zipfile.ZIP_DEFLATED, compresslevel=1) as zout:
-            for item in zin.infolist():
-                data = patched if item.filename == sheet_path else zin.read(item.filename)
-                # ZipInfoをそのまま使うと元の圧縮設定が引き継がれるので、新規Infoで軽圧縮。
-                info = zipfile.ZipInfo(item.filename, date_time=item.date_time)
-                info.compress_type = zipfile.ZIP_DEFLATED
-                info.external_attr = item.external_attr
-                info.create_system = item.create_system
-                info.flag_bits = item.flag_bits
-                zout.writestr(info, data, compress_type=zipfile.ZIP_DEFLATED, compresslevel=1)
+    元60MBブックや追加シートはコピーしない。
+    完成xlsxをメモリ上のbytesとして保持しない。
+    """
+    import os
+    import tempfile
+    from openpyxl import Workbook
 
-    return out.getvalue()
+    if len(raw_df) != len(ak_results):
+        raise ValueError("AK計算結果と後方数値データの行数が一致しません。")
+
+    tmp = tempfile.NamedTemporaryFile(
+        prefix="rear_numeric_ak_",
+        suffix=".xlsx",
+        delete=False,
+    )
+    tmp_path = tmp.name
+    tmp.close()
+
+    try:
+        wb = Workbook(write_only=True)
+        ws = wb.create_sheet("後方数値データ(加工版)")
+
+        headers = [str(c) for c in raw_df.columns]
+        while len(headers) < 37:
+            headers.append("")
+        headers[36] = "コスト"
+        ws.append(headers)
+
+        for row_values, ak_value in zip(
+            raw_df.itertuples(index=False, name=None),
+            ak_results,
+        ):
+            row = list(row_values)
+
+            while len(row) < 37:
+                row.append(None)
+
+            row[36] = (
+                None if ak_value is None or pd.isna(ak_value)
+                else float(ak_value)
+            )
+
+            clean_row = []
+            for value in row:
+                if value is None:
+                    clean_row.append(None)
+                    continue
+
+                if isinstance(value, pd.Timestamp):
+                    clean_row.append(value.to_pydatetime())
+                    continue
+
+                if isinstance(value, np.generic):
+                    value = value.item()
+
+                try:
+                    missing = pd.isna(value)
+                    if isinstance(missing, (bool, np.bool_)) and missing:
+                        clean_row.append(None)
+                        continue
+                except Exception:
+                    pass
+
+                clean_row.append(value)
+
+            ws.append(clean_row)
+
+        wb.save(tmp_path)
+        wb.close()
+        return tmp_path
+
+    except Exception:
+        try:
+            os.remove(tmp_path)
+        except OSError:
+            pass
+        raise
 
 
 def metric_options(df: pd.DataFrame) -> list[str]:
@@ -964,26 +1012,44 @@ render_kpis(df)
 
 st.divider()
 st.subheader("📤 AK列計算済みデータのエクスポート")
-st.caption("AKは各行のB年月・AF・L・Mを使って計算します。60MB級ファイル対策として、元Excelを作り直さずAKセルだけを差し替えて出力します。")
+st.caption("AKをPythonで計算し、「後方数値データ(加工版)」1シートだけを省メモリで出力します。元60MBブック全体は再構築しません。")
 
 if st.button("🛠️ AK列計算済みExcelを作成", key="create_ak_export"):
     try:
-        with st.spinner("AK列を計算し、元ExcelのAKだけ差し替えています…"):
+        import os
+
+        # 以前の出力があれば削除
+        old_path = st.session_state.pop("ak_export_path", None)
+        if old_path:
+            try:
+                os.remove(old_path)
+            except OSError:
+                pass
+
+        with st.spinner("AK列を計算し、1シートだけのExcelを作成しています…"):
             ak_results = build_ak_results(raw_df, cost_df)
-            st.session_state["ak_export_bytes"] = patch_ak_in_original_xlsx(file_bytes, ak_results)
+            export_path = patch_ak_in_original_xlsx(file_bytes, ak_results)
+            st.session_state["ak_export_path"] = export_path
+
         st.success("作成できました。下のボタンからダウンロードできます。")
+
     except Exception as exc:
-        st.session_state.pop("ak_export_bytes", None)
+        st.session_state.pop("ak_export_path", None)
         st.error(f"AK列計算済みExcelの作成に失敗しました: {exc}")
 
-if "ak_export_bytes" in st.session_state:
-    st.download_button(
-        "📥 AK列計算済みの後方数値データをダウンロード",
-        st.session_state["ak_export_bytes"],
-        "後方数値データ_AK計算済み.xlsx",
-        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-        key="download_ak_export",
-    )
+ak_export_path = st.session_state.get("ak_export_path")
+if ak_export_path:
+    import os
+
+    if os.path.exists(ak_export_path):
+        with open(ak_export_path, "rb") as export_file:
+            st.download_button(
+                "📥 AK列計算済みの後方数値データをダウンロード",
+                data=export_file,
+                file_name="後方数値データ_AK計算済み.xlsx",
+                mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                key="download_ak_export",
+            )
 
 # 分析軸候補：日付・識別・属性列。内部計算列は除外
 internal_cols = {"申込フラグ", "承認フラグ", "成約フラグ", "コスト_元データ", "コスト補完フラグ", "媒体月申込件数", "補完元コスト"}
@@ -1543,3 +1609,4 @@ with tab_mail:
 st.sidebar.divider()
 st.sidebar.subheader("⚙️ 個人設定")
 st.sidebar.caption("起動安定化のため、ブラウザへの設定保存機能は一時停止しています。")
+
