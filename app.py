@@ -9,10 +9,7 @@ import pandas as pd
 import streamlit as st
 from openpyxl import load_workbook
 
-try:
-    from streamlit_local_storage import LocalStorage
-except ImportError:
-    LocalStorage = None
+LocalStorage = None  # 起動安定化のためブラウザ保存機能を一時停止
 
 st.set_page_config(page_title="後方数値データ分析", layout="wide")
 st.title("📊 後方数値データ分析ダッシュボード")
@@ -53,7 +50,6 @@ st.markdown(
 PREFERENCE_STORAGE_KEY = "rear_numeric_analysis_preferences_v4"
 PREFERENCE_SCHEMA_VERSION = 4
 PREFERENCE_KEYS = [
-    "data_sheet", "master_sheet", "use_cost_sheet", "cost_sheet",
     "filter_date_range", "filter_big", "filter_middle", "filter_small",
     "media_groups", "media_metrics", "media_trend_group", "media_trend_metric",
     "win_selected_middle", "win_pattern_cols", "win_target_metric", "win_min_count",
@@ -277,8 +273,9 @@ def collect_preferences():
     return result
 
 
-local_storage = LocalStorage() if LocalStorage is not None else None
-load_browser_preferences(local_storage)
+local_storage = None
+st.session_state["_browser_preferences_loaded"] = True
+st.session_state.pop("_pending_browser_preferences", None)
 initialize_restored_defaults_once()
 
 
@@ -1010,7 +1007,7 @@ with tab_media:
     media_group_defaults = [c for c in admin_default("media_groups", default_groups) if c in dimension_cols]
     ensure_widget_default("media_groups", media_group_defaults, dimension_cols, multiple=True)
     consume_saved_preference("media_groups", dimension_cols, default=media_group_defaults, multiple=True)
-    groups = st.multiselect("集計軸", dimension_cols, default=media_group_defaults, key="media_groups")
+    groups = st.multiselect("集計軸", dimension_cols, key="media_groups")
     default_metrics = [m for m in CORE_METRICS if m in all_metrics]
     metric_actions = st.columns([1, 1, 6])
     if metric_actions[0].button("全選択", key="media_select_all"):
@@ -1020,7 +1017,7 @@ with tab_media:
         st.session_state["media_metrics"] = default_metrics
         st.rerun()
     consume_saved_preference("media_metrics", all_metrics, default=default_metrics, multiple=True)
-    selected_metrics = st.multiselect("表示項目", all_metrics, default=default_metrics, key="media_metrics")
+    selected_metrics = st.multiselect("表示項目", all_metrics, key="media_metrics")
     res = aggregate(df, groups)
     res = add_extra_numeric_sums(df, res, groups, selected_metrics)
     display_cols = list(dict.fromkeys(groups + [m for m in selected_metrics if m in res.columns]))
@@ -1069,7 +1066,7 @@ with tab_win:
     pattern_options = [c for c in ["小項目", "媒体名", "キャンペーン識別", "年齢グループ", "年収グループ", "性別", "利用目的", "都道府県"] if c in dimension_cols]
     pattern_defaults = [c for c in admin_default("win_pattern_cols", ["小項目", "利用目的", "年齢グループ"]) if c in pattern_options]
     consume_saved_preference("win_pattern_cols", pattern_options, default=pattern_defaults, multiple=True)
-    pattern_cols = st.multiselect("勝ちパターンの組み合わせ", pattern_options, default=pattern_defaults, key="win_pattern_cols")
+    pattern_cols = st.multiselect("勝ちパターンの組み合わせ", pattern_options, key="win_pattern_cols")
     win_metric_options = ["承認率", "申込件数", "投下倍率", "取扱金額_翌月", "申込CPA", "承認CPA", "成約件数", "成約率"]
     consume_saved_preference("win_target_metric", win_metric_options, default=admin_default("win_target_metric", "承認率"))
     consume_saved_preference("win_min_count", default=admin_default("win_min_count", 30))
@@ -1545,21 +1542,4 @@ with tab_mail:
 # ======================
 st.sidebar.divider()
 st.sidebar.subheader("⚙️ 個人設定")
-if LocalStorage is None:
-    st.sidebar.warning("ブラウザ保存機能を使うには requirements.txt に streamlit-local-storage を追加してください。")
-else:
-    st.sidebar.caption("コード側のデフォルトを維持し、保存した項目だけこのブラウザで復元します。")
-    if st.sidebar.button("💾 現在の設定を保存", width="stretch", key="save_browser_preferences"):
-        payload = json.dumps({"schema_version": PREFERENCE_SCHEMA_VERSION, "values": collect_preferences()}, ensure_ascii=False)
-        storage_set_item(local_storage, PREFERENCE_STORAGE_KEY, payload, component_key="save_preferences_component")
-        time.sleep(0.8)
-        st.sidebar.success("このブラウザに設定を保存しました。")
-
-    if st.sidebar.button("↩️ 保存設定を初期化", width="stretch", key="reset_browser_preferences"):
-        storage_set_item(local_storage, PREFERENCE_STORAGE_KEY, "", component_key="reset_preferences_component")
-        for pref_key in PREFERENCE_KEYS:
-            st.session_state.pop(pref_key, None)
-        st.session_state.pop("_pending_browser_preferences", None)
-        st.session_state["_browser_preferences_loaded"] = True
-        time.sleep(0.8)
-        st.rerun()
+st.sidebar.caption("起動安定化のため、ブラウザへの設定保存機能は一時停止しています。")
