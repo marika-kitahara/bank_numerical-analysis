@@ -1,8 +1,6 @@
 import json
 import re
 import time
-import os
-import tempfile
 from io import BytesIO
 
 import numpy as np
@@ -608,77 +606,108 @@ def build_ak_results(raw_df: pd.DataFrame, cost_df: pd.DataFrame) -> list[float 
     ]
 
 
-def create_ak_one_sheet_xlsx(
-    raw_df: pd.DataFrame,
-    ak_results: list[float | None],
-) -> str:
-    """後方数値データ(加工版)だけを省メモリで新規xlsxへ書き出す。
+def patch_ak_in_original_xlsx(file_bytes: bytes, ak_results: list[float | None]) -> bytes:
+    """元xlsxのZIP構造をそのまま使い、対象シートXMLのAKセルだけ差し替える。
 
-    元ブックの他シートは一切コピーしない。
-    openpyxlのwrite_onlyモードで、60MB級入力でも出力時のメモリ増加を抑える。
+    全セルをopenpyxlで書き直さないため、60MB級ファイルでも処理時間とメモリを大幅に抑える。
+    他セル・書式・他シートは元ファイルをそのまま保持する。
     """
-    from openpyxl import Workbook
+    import posixpath
+    import re as _re
+    import zipfile
+    from xml.etree import ElementTree as ET
 
-    if len(raw_df) != len(ak_results):
-        raise ValueError("AK計算結果と後方数値データの行数が一致しません。")
+    src = BytesIO(file_bytes)
+    out = BytesIO()
 
-    tmp = tempfile.NamedTemporaryFile(
-        prefix="rear_numeric_ak_",
-        suffix=".xlsx",
-        delete=False,
-    )
-    tmp_path = tmp.name
-    tmp.close()
+    with zipfile.ZipFile(src, "r") as zin:
+        # workbook.xml から対象シートの relationship id を取得。
+        wb_root = ET.fromstring(zin.read("xl/workbook.xml"))
+        ns = {
+            "main": "http://schemas.openxmlformats.org/spreadsheetml/2006/main",
+            "r": "http://schemas.openxmlformats.org/officeDocument/2006/relationships",
+        }
+        rel_id = None
+        for sheet in wb_root.findall("main:sheets/main:sheet", ns):
+            if sheet.attrib.get("name") == "後方数値データ(加工版)":
+                rel_id = sheet.attrib.get("{http://schemas.openxmlformats.org/officeDocument/2006/relationships}id")
+                break
+        if not rel_id:
+            raise ValueError("『後方数値データ(加工版)』シートが見つかりません。")
 
-    try:
-        wb = Workbook(write_only=True)
-        ws = wb.create_sheet(title="後方数値データ(加工版)")
+        rel_root = ET.fromstring(zin.read("xl/_rels/workbook.xml.rels"))
+        target = None
+        for rel in rel_root:
+            if rel.attrib.get("Id") == rel_id:
+                target = rel.attrib.get("Target")
+                break
+        if not target:
+            raise ValueError("対象シートの内部XMLを特定できません。")
 
-        # ヘッダー
-        headers = [str(c) for c in raw_df.columns]
+        if target.startswith("/"):
+            sheet_path = target.lstrip("/")
+        else:
+            sheet_path = posixpath.normpath(posixpath.join("xl", target))
 
-        # AK列はExcel上の37列目。既存列数が足りない場合もAKまで補う。
-        while len(headers) < 37:
-            headers.append("")
-        headers[36] = "コスト"
-        ws.append(headers)
+        # AKセルは既存セルの属性（style等）を残したまま値だけ差し替える。
+        # 元データの1行目はヘッダーなので、DataFrame index 0 -> Excel row 2。
+        sheet_xml = zin.read(sheet_path)
+        result_by_row = {i + 2: v for i, v in enumerate(ak_results)}
 
-        # DataFrameを丸ごと別コピーせず、1行ずつ出力する。
-        for row_values, ak_value in zip(
-            raw_df.itertuples(index=False, name=None),
-            ak_results,
-        ):
-            row = list(row_values)
+        cell_pat = _re.compile(
+            rb'<c(?P<attrs>[^>]*\br="AK(?P<row>\d+)"[^>]*)>(?P<body>.*?)</c>',
+            _re.DOTALL,
+        )
+        seen_rows = set()
 
-            while len(row) < 37:
-                row.append(None)
+        def replace_cell(match):
+            row = int(match.group("row"))
+            if row not in result_by_row:
+                return match.group(0)
+            seen_rows.add(row)
+            attrs = match.group("attrs")
+            # inlineStr / shared-string等の型指定は数値と両立しないため除去。
+            attrs = _re.sub(rb'\s+t="[^"]*"', b'', attrs)
+            value = result_by_row[row]
+            if value is None or pd.isna(value):
+                return b'<c' + attrs + b'></c>'
+            value_text = format(float(value), ".15g").encode("ascii")
+            return b'<c' + attrs + b'><v>' + value_text + b'</v></c>'
 
-            row[36] = None if ak_value is None or pd.isna(ak_value) else float(ak_value)
+        patched = cell_pat.sub(replace_cell, sheet_xml)
 
-            # openpyxlが扱いやすいPython値へ変換
-            cleaned = []
-            for value in row:
-                if pd.isna(value):
-                    cleaned.append(None)
-                elif isinstance(value, np.generic):
-                    cleaned.append(value.item())
-                elif isinstance(value, pd.Timestamp):
-                    cleaned.append(value.to_pydatetime())
+        # AKセル自体が存在しない行があれば、その行XMLの末尾へ追加する。
+        missing = set(result_by_row) - seen_rows
+        if missing:
+            row_pat = _re.compile(rb'<row(?P<attrs>[^>]*\br="(?P<row>\d+)"[^>]*)>(?P<body>.*?)</row>', _re.DOTALL)
+
+            def add_missing_cell(match):
+                row = int(match.group("row"))
+                if row not in missing:
+                    return match.group(0)
+                value = result_by_row[row]
+                if value is None or pd.isna(value):
+                    cell = f'<c r="AK{row}"></c>'.encode("ascii")
                 else:
-                    cleaned.append(value)
+                    value_text = format(float(value), ".15g")
+                    cell = f'<c r="AK{row}"><v>{value_text}</v></c>'.encode("ascii")
+                return b'<row' + match.group("attrs") + b'>' + match.group("body") + cell + b'</row>'
 
-            ws.append(cleaned)
+            patched = row_pat.sub(add_missing_cell, patched)
 
-        wb.save(tmp_path)
-        wb.close()
-        return tmp_path
+        # それ以外のZIPエントリはコピー。対象sheet XMLだけ置換。
+        with zipfile.ZipFile(out, "w", compression=zipfile.ZIP_DEFLATED, compresslevel=1) as zout:
+            for item in zin.infolist():
+                data = patched if item.filename == sheet_path else zin.read(item.filename)
+                # ZipInfoをそのまま使うと元の圧縮設定が引き継がれるので、新規Infoで軽圧縮。
+                info = zipfile.ZipInfo(item.filename, date_time=item.date_time)
+                info.compress_type = zipfile.ZIP_DEFLATED
+                info.external_attr = item.external_attr
+                info.create_system = item.create_system
+                info.flag_bits = item.flag_bits
+                zout.writestr(info, data, compress_type=zipfile.ZIP_DEFLATED, compresslevel=1)
 
-    except Exception:
-        try:
-            os.remove(tmp_path)
-        except OSError:
-            pass
-        raise
+    return out.getvalue()
 
 
 def metric_options(df: pd.DataFrame) -> list[str]:
@@ -935,39 +964,26 @@ render_kpis(df)
 
 st.divider()
 st.subheader("📤 AK列計算済みデータのエクスポート")
-st.caption("AKは各行のB年月・AF・L・Mを使って計算します。60MB級ファイル対策として、後方数値データ(加工版)の1シートだけを新規Excelとして出力します。")
+st.caption("AKは各行のB年月・AF・L・Mを使って計算します。60MB級ファイル対策として、元Excelを作り直さずAKセルだけを差し替えて出力します。")
 
 if st.button("🛠️ AK列計算済みExcelを作成", key="create_ak_export"):
     try:
-        # 前回作成した一時ファイルがあれば削除
-        old_path = st.session_state.pop("ak_export_path", None)
-        if old_path:
-            try:
-                os.remove(old_path)
-            except OSError:
-                pass
-
-        with st.spinner("AK列を計算し、1シートだけのExcelを作成しています…"):
+        with st.spinner("AK列を計算し、元ExcelのAKだけ差し替えています…"):
             ak_results = build_ak_results(raw_df, cost_df)
-            st.session_state["ak_export_path"] = create_ak_one_sheet_xlsx(
-                raw_df,
-                ak_results,
-            )
+            st.session_state["ak_export_bytes"] = patch_ak_in_original_xlsx(file_bytes, ak_results)
         st.success("作成できました。下のボタンからダウンロードできます。")
     except Exception as exc:
-        st.session_state.pop("ak_export_path", None)
+        st.session_state.pop("ak_export_bytes", None)
         st.error(f"AK列計算済みExcelの作成に失敗しました: {exc}")
 
-ak_export_path = st.session_state.get("ak_export_path")
-if ak_export_path and os.path.exists(ak_export_path):
-    with open(ak_export_path, "rb") as export_file:
-        st.download_button(
-            "📥 AK列計算済みの後方数値データをダウンロード",
-            data=export_file,
-            file_name="後方数値データ_AK計算済み.xlsx",
-            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-            key="download_ak_export",
-        )
+if "ak_export_bytes" in st.session_state:
+    st.download_button(
+        "📥 AK列計算済みの後方数値データをダウンロード",
+        st.session_state["ak_export_bytes"],
+        "後方数値データ_AK計算済み.xlsx",
+        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        key="download_ak_export",
+    )
 
 # 分析軸候補：日付・識別・属性列。内部計算列は除外
 internal_cols = {"申込フラグ", "承認フラグ", "成約フラグ", "コスト_元データ", "コスト補完フラグ", "媒体月申込件数", "補完元コスト"}
