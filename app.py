@@ -14,7 +14,6 @@ LocalStorage = None  # 起動安定化のためブラウザ保存機能を一時
 st.set_page_config(page_title="後方数値データ分析", layout="wide")
 st.title("📊 後方数値データ分析ダッシュボード")
 
-
 st.markdown(
     """
     <style>
@@ -42,11 +41,6 @@ st.markdown(
     unsafe_allow_html=True,
 )
 
-
-
-# ======================
-# ブラウザ別設定保存
-# ======================
 PREFERENCE_STORAGE_KEY = "rear_numeric_analysis_preferences_v4"
 PREFERENCE_SCHEMA_VERSION = 4
 PREFERENCE_KEYS = [
@@ -60,8 +54,6 @@ PREFERENCE_KEYS = [
     "mail_segment_col", "mail_segment_metric",
 ]
 
-
-# 管理者デフォルト。ブラウザ保存値がない初回表示・設定初期化後はこの値を使う。
 ADMIN_DEFAULTS = {
     "media_groups": ["大項目", "中項目", "小項目"],
     "media_trend_group": "中項目",
@@ -78,13 +70,9 @@ ADMIN_DEFAULTS = {
     "mail_metric2": "承認率",
 }
 
-
 def admin_default(key, fallback=None):
     value = ADMIN_DEFAULTS.get(key, fallback)
     return list(value) if isinstance(value, list) else value
-
-
-
 
 def ensure_widget_default(key, default, options=None, multiple=False):
     """ウィジェット生成前に管理者デフォルトを確実に反映する。
@@ -116,7 +104,6 @@ def ensure_widget_default(key, default, options=None, multiple=False):
         elif valid:
             st.session_state[key] = valid[0]
 
-
 def initialize_restored_defaults_once():
     """今回指定された管理者デフォルトを、古いセッション状態より優先して一度だけ復元する。"""
     marker = "_restored_admin_defaults_v4"
@@ -131,7 +118,6 @@ def initialize_restored_defaults_once():
         st.session_state.pop(key, None)
 
     st.session_state[marker] = True
-
 
 def serializable_value(value):
     """session_stateの値をlocalStorageへ保存できる形へ変換する。"""
@@ -149,7 +135,6 @@ def serializable_value(value):
     if isinstance(value, np.generic):
         return value.item()
     return value
-
 
 def consume_saved_preference(
     key,
@@ -197,7 +182,6 @@ def consume_saved_preference(
     if value is not None:
         st.session_state[key] = value
 
-
 def storage_get_item(storage, item_key, component_key=None):
     """streamlit-local-storage の版差を吸収して値を取得する。"""
     if storage is None:
@@ -222,7 +206,6 @@ def storage_set_item(storage, item_key, value, component_key=None):
         # 古い版は Streamlit component 用の key 引数を受け付けない
         pass
     return storage.setItem(item_key, value)
-
 
 def load_browser_preferences(storage):
     """localStorageから保存設定を読み込み、段階的適用用の待機領域へ入れる。"""
@@ -264,7 +247,6 @@ def load_browser_preferences(storage):
     except (TypeError, ValueError, json.JSONDecodeError):
         st.session_state["_browser_preferences_loaded"] = True
 
-
 def collect_preferences():
     result = {}
     for key in PREFERENCE_KEYS:
@@ -272,12 +254,10 @@ def collect_preferences():
             result[key] = serializable_value(st.session_state[key])
     return result
 
-
 local_storage = None
 st.session_state["_browser_preferences_loaded"] = True
 st.session_state.pop("_pending_browser_preferences", None)
 initialize_restored_defaults_once()
-
 
 CORE_METRICS = [
     "申込件数", "承認件数", "成約件数", "承認率", "成約率",
@@ -286,7 +266,6 @@ CORE_METRICS = [
 ]
 RATE_METRICS = {"承認率", "成約率", "申込CPA", "承認CPA", "投下倍率"}
 
-# Excelのふりがな情報などが見出しに連結された場合も吸収する
 COLUMN_ALIASES = {
     "媒体名": ["媒体名", "媒体名バイタイメイ"],
     "媒体": ["媒体", "媒体バイタイ"],
@@ -300,7 +279,6 @@ COLUMN_ALIASES = {
     "代理店コード": ["代理店コード", "代理店コードダイリテン"],
     "配信日": ["配信日", "配信日ハイシンビ"],
 }
-
 
 def clean_columns(df: pd.DataFrame) -> pd.DataFrame:
     df = df.copy()
@@ -316,7 +294,6 @@ def clean_columns(df: pd.DataFrame) -> pd.DataFrame:
                 break
     return df.rename(columns=rename)
 
-
 def make_unique_columns(df: pd.DataFrame) -> pd.DataFrame:
     seen = {}
     cols = []
@@ -328,13 +305,11 @@ def make_unique_columns(df: pd.DataFrame) -> pd.DataFrame:
     df.columns = cols
     return df
 
-
 REQUIRED_SHEETS = [
     "後方数値データ(加工版)",
     "媒体コードマスタver3",
     "コストデータ",
 ]
-
 
 @st.cache_data(show_spinner="必要な3シートを読み込んでいます…")
 def read_required_sheets(file_bytes: bytes) -> dict[str, pd.DataFrame]:
@@ -352,12 +327,10 @@ def read_required_sheets(file_bytes: bytes) -> dict[str, pd.DataFrame]:
         for sheet_name, df in book.items()
     }
 
-
 def safe_div(numerator, denominator):
     if isinstance(denominator, pd.Series):
         return numerator.div(denominator.replace(0, np.nan))
     return np.nan if denominator in (0, None) or pd.isna(denominator) else numerator / denominator
-
 
 def normalize_month(value) -> str | None:
     if pd.isna(value):
@@ -368,7 +341,6 @@ def normalize_month(value) -> str | None:
         m = re.search(r"(20\d{2})\D+(\d{1,2})", text)
         return f"{m.group(1)}-{int(m.group(2)):02d}" if m else None
     return dt.strftime("%Y-%m")
-
 
 def prepare_cost_lookup(cost_df: pd.DataFrame) -> pd.DataFrame:
     cost_df = clean_columns(cost_df)
@@ -392,7 +364,6 @@ def prepare_cost_lookup(cost_df: pd.DataFrame) -> pd.DataFrame:
         .groupby(["小項目2", "申込月"], as_index=False)["補完元コスト"].sum()
     )
 
-
 def preprocess(raw: pd.DataFrame, master: pd.DataFrame, cost_df: pd.DataFrame | None) -> pd.DataFrame:
     df = clean_columns(raw)
     master = clean_columns(master)
@@ -409,7 +380,6 @@ def preprocess(raw: pd.DataFrame, master: pd.DataFrame, cost_df: pd.DataFrame | 
             df[col] = pd.to_datetime(df[col], errors="coerce")
     df["申込月"] = df["申込日"].dt.strftime("%Y-%m")
 
-    # 後方データに既に付与済みの列があっても、マスタの最新分類を優先
     master_cols = [
         "媒体コード", "テンプレコード", "メニュー名", "大項目", "中項目",
         "小項目", "小項目2", "代理店コード", "配信日", "ポイント",
@@ -440,7 +410,6 @@ def preprocess(raw: pd.DataFrame, master: pd.DataFrame, cost_df: pd.DataFrame | 
         if col in df.columns:
             df[col] = pd.to_numeric(df[col], errors="coerce")
 
-    # AK列コストがエラー/空欄の行だけ、コストデータの媒体×月総額を申込行数で按分
     df["コスト_元データ"] = pd.to_numeric(df.get("コスト", np.nan), errors="coerce")
     df["コスト補完フラグ"] = 0
     if cost_df is not None and not cost_df.empty and "小項目2" in df.columns:
@@ -471,7 +440,6 @@ def preprocess(raw: pd.DataFrame, master: pd.DataFrame, cost_df: pd.DataFrame | 
         )
     return df
 
-
 def aggregate(df: pd.DataFrame, group_cols: list[str]) -> pd.DataFrame:
     group_cols = list(dict.fromkeys([c for c in group_cols if c in df.columns]))
     work = df.copy()
@@ -498,10 +466,7 @@ def aggregate(df: pd.DataFrame, group_cols: list[str]) -> pd.DataFrame:
     result["投下倍率"] = safe_div(result["取扱金額_翌月"], result["コスト"])
     return result
 
-
 def add_extra_numeric_sums(df: pd.DataFrame, result: pd.DataFrame, group_cols: list[str], selected: list[str]) -> pd.DataFrame:
-    # 集計軸が数値型として読み込まれていても、表示項目側へ重複追加しない。
-    # 例：空欄が多い「大項目」がfloat型になった場合、reset_index時に列名衝突していた。
     group_cols = list(dict.fromkeys(c for c in group_cols if c in df.columns))
     selected = list(dict.fromkeys(selected))
     extra = [
@@ -525,20 +490,17 @@ def add_extra_numeric_sums(df: pd.DataFrame, result: pd.DataFrame, group_cols: l
         result[col] = df[col].sum(min_count=1)
     return result
 
-
 def format_table(df: pd.DataFrame):
     formats = {c: "{:.1%}" for c in ["承認率", "成約率"] if c in df.columns}
     formats.update({c: "{:,.0f}" for c in ["コスト", "申込CPA", "承認CPA", "取扱金額_当月", "取扱金額_翌月", "取扱金額_翌々月"] if c in df.columns})
     formats.update({c: "{:.2f}" for c in ["投下倍率"] if c in df.columns})
     return df.style.format(formats, na_rep="-")
 
-
 def to_excel(df: pd.DataFrame) -> bytes:
     output = BytesIO()
     with pd.ExcelWriter(output, engine="openpyxl") as writer:
         df.to_excel(writer, index=False, sheet_name="分析結果")
     return output.getvalue()
-
 
 def _excel_month_key(value) -> str | None:
     """Excelセル値を YYYY-MM に正規化する。"""
@@ -551,7 +513,6 @@ def _excel_month_key(value) -> str | None:
     m = re.search(r"(20\d{2})\D*(\d{1,2})", text)
     return f"{m.group(1)}-{int(m.group(2)):02d}" if m else None
 
-
 def _excel_key(value) -> str:
     """MATCH/COUNTIFS用に文字列キーを揃える。"""
     if value is None:
@@ -559,7 +520,6 @@ def _excel_key(value) -> str:
     if isinstance(value, float) and value.is_integer():
         return str(int(value))
     return str(value).strip()
-
 
 def build_ak_results(raw_df: pd.DataFrame, cost_df: pd.DataFrame) -> list[float | None]:
     """Excelで検証済みの式をそのままPythonで再現する。
@@ -600,8 +560,6 @@ def build_ak_results(raw_df: pd.DataFrame, cost_df: pd.DataFrame) -> list[float 
     if cost_df.shape[1] < 5:
         raise ValueError("コストデータにE列まで存在しません。")
 
-    # 後方数値データ
-    # B=1, L=11, M=12, AF=31（0始まり）
     months = raw_df.iloc[:, 1].map(_excel_month_key)
     ages = raw_df.iloc[:, 11]
     genders = raw_df.iloc[:, 12]
@@ -628,25 +586,16 @@ def build_ak_results(raw_df: pd.DataFrame, cost_df: pd.DataFrame) -> list[float 
     raw_gender = genders.map(gender_key)
     raw_decade = ages.map(decade_key)
 
-    # --------------------------------------------------
-    # 月列MATCH
-    # Excelの見た目/実体が日付でも一致するよう YYYY-MM に正規化
-    # --------------------------------------------------
     month_to_col = {}
     for col_idx in range(4, cost_df.shape[1]):
         month = _excel_month_key(cost_df.columns[col_idx])
         if month and month not in month_to_col:
             month_to_col[month] = col_idx
 
-    # --------------------------------------------------
-    # 分子 MATCH
-    # Excel式は B:B / C:C / D:D の「全行」が対象。
-    # --------------------------------------------------
     full_cost_af = cost_df.iloc[:, 1].map(_excel_key)
     full_cost_gender = cost_df.iloc[:, 2].map(gender_key)
     full_cost_decade = cost_df.iloc[:, 3].map(_excel_key)
 
-    # (AF, 性別, 年代完全一致) -> 最初に一致したDataFrame行位置
     numerator_row = {}
     for row_pos, (af, gender, decade_text) in enumerate(
         zip(full_cost_af, full_cost_gender, full_cost_decade)
@@ -658,12 +607,6 @@ def build_ak_results(raw_df: pd.DataFrame, cost_df: pd.DataFrame) -> list[float 
         if key not in numerator_row:
             numerator_row[key] = row_pos
 
-    # --------------------------------------------------
-    # 分母 XMATCH
-    # Excel式どおり B2:B100 / C2:C100 / D2:D100 の99行だけ。
-    # XMATCHは「件数」ではなく、最初に一致した位置（1始まり）を返す。
-    # D列だけ SEARCH なので年代は「含む」で判定。
-    # --------------------------------------------------
     denom_cost = cost_df.iloc[:99]
 
     denom_af = denom_cost.iloc[:, 1].map(_excel_key)
@@ -672,7 +615,6 @@ def build_ak_results(raw_df: pd.DataFrame, cost_df: pd.DataFrame) -> list[float 
 
     first_match_pos = {}
 
-    # 後方側に実際に存在する年代だけで辞書を作る
     target_decades = {
         d for d in raw_decade.tolist()
         if d
@@ -693,9 +635,6 @@ def build_ak_results(raw_df: pd.DataFrame, cost_df: pd.DataFrame) -> list[float 
                 if key not in first_match_pos:
                     first_match_pos[key] = pos
 
-    # --------------------------------------------------
-    # 各行のAK値
-    # --------------------------------------------------
     results = []
 
     for month, af, gender, decade in zip(
@@ -728,7 +667,6 @@ def build_ak_results(raw_df: pd.DataFrame, cost_df: pd.DataFrame) -> list[float 
         results.append(float(numerator) / float(denominator))
 
     return results
-
 
 def patch_ak_in_original_xlsx(file_bytes: bytes, ak_results: list[float | None]) -> str:
     """後方数値データ(加工版)1シートだけを省メモリで一時xlsxへ出力する。
@@ -811,10 +749,7 @@ def patch_ak_in_original_xlsx(file_bytes: bytes, ak_results: list[float | None])
             pass
         raise
 
-
 def metric_options(df: pd.DataFrame) -> list[str]:
-    # 分類・識別系の列は、Excel上で全空欄だと数値型(float)判定されることがある。
-    # それらを表示指標に混ぜず、実際の数値項目だけを候補にする。
     excluded = {
         "申込フラグ", "承認フラグ", "成約フラグ", "コスト_元データ",
         "コスト補完フラグ", "媒体月申込件数", "補完元コスト",
@@ -828,7 +763,6 @@ def metric_options(df: pd.DataFrame) -> list[str]:
         if c not in excluded and c not in CORE_METRICS
     ]
     return list(dict.fromkeys(CORE_METRICS + extras))
-
 
 def selection_filter(df: pd.DataFrame, column: str, label: str, key: str) -> pd.DataFrame:
     """候補が存在する分類列だけをサイドバーへ表示する。"""
@@ -849,7 +783,6 @@ def selection_filter(df: pd.DataFrame, column: str, label: str, key: str) -> pd.
         placeholder="すべて",
     )
     return df[df[column].astype(str).isin(selected)] if selected else df
-
 
 def render_kpis(df: pd.DataFrame):
     kpi = aggregate(df, [])
@@ -881,7 +814,6 @@ def render_kpis(df: pd.DataFrame):
         unsafe_allow_html=True,
     )
 
-    # 7枚を一列に詰め込むと金額が省略されるため、4枚＋3枚の二段表示にする。
     first = st.columns(4)
     first[0].metric("申込件数", f"{row['申込件数']:,.0f}")
     first[1].metric("承認件数", f"{row['承認件数']:,.0f}")
@@ -892,7 +824,6 @@ def render_kpis(df: pd.DataFrame):
     second[0].metric("申込CPA", f"¥{row['申込CPA']:,.0f}" if pd.notna(row["申込CPA"]) else "-")
     second[1].metric("承認CPA", f"¥{row['承認CPA']:,.0f}" if pd.notna(row["承認CPA"]) else "-")
     second[2].metric("投下倍率", f"{row['投下倍率']:.2f}" if pd.notna(row["投下倍率"]) else "-")
-
 
 def allocation_simulator(df: pd.DataFrame):
     st.subheader("💸 媒体アロケーション影響試算")
@@ -914,7 +845,6 @@ def allocation_simulator(df: pd.DataFrame):
     consume_saved_preference("alloc_to_middle", middles, default=middles[1] if len(middles) > 1 else middles[0])
     consume_saved_preference("alloc_amount", default=admin_default("alloc_amount", 500000.0))
 
-    # 依存する選択肢が変わった際、古いsession_state値が残って選択不能になるのを防ぐ。
     if st.session_state.get("alloc_from_middle") not in middles:
         st.session_state["alloc_from_middle"] = middles[0]
     if st.session_state.get("alloc_to_middle") not in middles:
@@ -997,7 +927,6 @@ def allocation_simulator(df: pd.DataFrame):
         if effective_amount < amount:
             st.warning(f"元媒体の実績コストを超えるため、試算上は {effective_amount:,.0f}円で計算しました。")
 
-
 uploaded_file = st.file_uploader(
     "後方数値データ・媒体コードマスタ・コストデータを含むExcel",
     type=["xlsx"],
@@ -1019,7 +948,6 @@ try:
     cost_df = loaded_sheets["コストデータ"]
     base_df = preprocess(raw_df, master_df, cost_df)
 except ValueError as exc:
-    # pandas/openpyxlが規定シート不足を検知した場合に、利用者へ分かりやすく案内する。
     message = str(exc)
     if "Worksheet named" in message:
         st.error(
@@ -1072,7 +1000,6 @@ if st.button("🛠️ AK列計算済みExcelを作成", key="create_ak_export"):
     try:
         import os
 
-        # 以前の出力があれば削除
         old_path = st.session_state.pop("ak_export_path", None)
         if old_path:
             try:
@@ -1105,7 +1032,6 @@ if ak_export_path:
                 key="download_ak_export",
             )
 
-# 分析軸候補：日付・識別・属性列。内部計算列は除外
 internal_cols = {"申込フラグ", "承認フラグ", "成約フラグ", "コスト_元データ", "コスト補完フラグ", "媒体月申込件数", "補完元コスト"}
 dimension_cols = [
     c for c in df.columns
@@ -1291,7 +1217,6 @@ with tab_mail:
                 if v and v.casefold() != "nan"
             )
 
-            # 共通フィルタやファイル変更で候補が変わっても、古い選択値を残さない。
             consume_saved_preference("mail_smalls", small_options, default=small_options[: min(5, len(small_options))], multiple=True)
             saved_smalls = st.session_state.get("mail_smalls", small_options[: min(5, len(small_options))])
             if not isinstance(saved_smalls, list):
@@ -1322,7 +1247,6 @@ with tab_mail:
                         if v and v.casefold() != "nan"
                     )
 
-                    # 小項目を変更するとキャンペーン候補も変わるため、無効な選択値を先に除外する。
                     consume_saved_preference("mail_campaigns", campaigns, default=campaigns[: min(10, len(campaigns))], multiple=True)
                     saved_campaigns = st.session_state.get(
                         "mail_campaigns", campaigns[: min(10, len(campaigns))]
@@ -1356,7 +1280,6 @@ with tab_mail:
                             if not available_mail_metrics:
                                 st.info("集計可能な表示項目がありません。")
                             else:
-                                # 一覧表のデフォルト表示は申込件数。
                                 consume_saved_preference("mail_metrics", available_mail_metrics, default=[m for m in admin_default("mail_metrics", ["申込件数"]) if m in available_mail_metrics], multiple=True)
                                 consume_saved_preference("mail_metric1", available_mail_metrics, default=admin_default("mail_metric1", "申込件数") if admin_default("mail_metric1", "申込件数") in available_mail_metrics else available_mail_metrics[0])
                                 consume_saved_preference("mail_metric2", available_mail_metrics, default=admin_default("mail_metric2", "承認率") if admin_default("mail_metric2", "承認率") in available_mail_metrics else available_mail_metrics[0])
@@ -1419,7 +1342,6 @@ with tab_mail:
                                     "1グラフにつき1指標を表示します。横軸は小項目、同じ小項目内でキャンペーンを横並びに比較します。"
                                 )
 
-                                # Altairで xOffset を指定し、積み上げではなく集合縦棒に固定する。
                                 chart_source = mail_res[["小項目", campaign_col] + list(dict.fromkeys([metric1, metric2]))].copy()
                                 chart_source["小項目"] = pd.Categorical(
                                     chart_source["小項目"], categories=selected_smalls, ordered=True
@@ -1487,9 +1409,6 @@ with tab_mail:
                                     "メルマガ分析_小項目別.xlsx",
                                 )
 
-                                # ======================
-                                # メルマガ × セグメント分析
-                                # ======================
                                 st.divider()
                                 st.subheader("メルマガのセグメント別分析")
                                 st.caption(
@@ -1657,9 +1576,6 @@ with tab_mail:
                                             "メルマガ分析_セグメント別.xlsx",
                                         )
 
-# ======================
-# ブラウザ設定の保存・初期化
-# ======================
 st.sidebar.divider()
 st.sidebar.subheader("⚙️ 個人設定")
 st.sidebar.caption("起動安定化のため、ブラウザへの設定保存機能は一時停止しています。")
